@@ -3030,7 +3030,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
         "status", "cron", "doctor", "config", "pairing", "skills", "tools",
         "mcp", "sessions", "insights", "version", "update", "uninstall",
-        "keystore",
+        "keystore", "wallet",
     }
     _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
 
@@ -4214,6 +4214,19 @@ For more help on a command:
             print("\n  Keystore dependencies not installed.")
             print("  Install with: pip install 'hermes-agent[keystore]'\n")
         _ks_parser.set_defaults(func=_cmd_keystore_stub)
+
+    # =========================================================================
+    # wallet command
+    # =========================================================================
+    try:
+        from wallet.cli import register_subparser as register_wallet
+        register_wallet(subparsers)
+    except ImportError:
+        _w_parser = subparsers.add_parser("wallet", help="Manage crypto wallets (requires wallet extras)")
+        def _cmd_wallet_stub(args):
+            print("\n  Wallet dependencies not installed.")
+            print("  Install with: pip install 'hermes-agent[wallet]'\n")
+        _w_parser.set_defaults(func=_cmd_wallet_stub)
     
     # =========================================================================
     # Parse and execute
