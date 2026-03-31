@@ -28,6 +28,7 @@ class _FakeAgent:
         self.session_id = session_id
         self.session_start = session_start
         self.model = "anthropic/claude-opus-4.6"
+        self.service_tier = None
         self._last_flushed_db_idx = 7
         self._todo_store = TodoStore()
         self._todo_store.write(
@@ -137,6 +138,8 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     cli = _prepare_cli_with_active_session(tmp_path)
     old_session_id = cli.session_id
     old_session_start = cli.session_start
+    cli.codex_service_tier = "fast"
+    cli.agent.service_tier = "fast"
 
     cli.process_command("/new")
 
@@ -154,10 +157,26 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     assert cli.agent.session_id == cli.session_id
     assert cli.agent._last_flushed_db_idx == 0
     assert cli.agent._todo_store.read() == []
+    assert cli.codex_service_tier is None
+    assert cli.agent.service_tier is None
     assert cli.session_start > old_session_start
     assert cli.agent.session_start == cli.session_start
     cli.agent.flush_memories.assert_called_once_with([{"role": "user", "content": "hello"}])
     cli.agent._invalidate_system_prompt.assert_called_once()
+
+
+def test_resume_command_clears_fast_mode(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    resumed_session_id = "previous_session_123"
+    cli._session_db.create_session(session_id=resumed_session_id, source="cli", model=cli.model)
+    cli.codex_service_tier = "fast"
+    cli.agent.service_tier = "fast"
+
+    cli._handle_resume_command(f"/resume {resumed_session_id}")
+
+    assert cli.session_id == resumed_session_id
+    assert cli.codex_service_tier is None
+    assert cli.agent.service_tier is None
 
 
 def test_reset_command_is_alias_for_new_session(tmp_path):

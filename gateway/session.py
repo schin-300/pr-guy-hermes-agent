@@ -357,6 +357,9 @@ class SessionEntry:
     
     # Last API-reported prompt tokens (for accurate compression pre-check)
     last_prompt_tokens: int = 0
+
+    # Session-local runtime overrides (slash commands like /fast).
+    service_tier_override: Optional[str] = None
     
     # Set when a session was created because the previous one expired;
     # consumed once by the message handler to inject a notice into context
@@ -381,6 +384,7 @@ class SessionEntry:
             "last_prompt_tokens": self.last_prompt_tokens,
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_status": self.cost_status,
+            "service_tier_override": self.service_tier_override,
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -416,6 +420,7 @@ class SessionEntry:
             last_prompt_tokens=data.get("last_prompt_tokens", 0),
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
             cost_status=data.get("cost_status", "unknown"),
+            service_tier_override=data.get("service_tier_override"),
         )
 
 
@@ -710,6 +715,7 @@ class SessionStore:
                 display_name=source.chat_name,
                 platform=source.platform,
                 chat_type=source.chat_type,
+                service_tier_override=None,
                 was_auto_reset=was_auto_reset,
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
@@ -802,6 +808,26 @@ class SessionStore:
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
 
+    def get_session(self, session_key: str) -> Optional[SessionEntry]:
+        """Return a session entry by key without creating a new session."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            return self._entries.get(session_key)
+
+    def set_service_tier_override(self, session_key: str, service_tier: Optional[str]) -> bool:
+        """Persist a session-local service-tier override."""
+        from hermes_cli.fast_mode import normalize_service_tier
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return False
+            entry.service_tier_override = normalize_service_tier(service_tier)
+            entry.updated_at = _now()
+            self._save()
+            return True
+
     def reset_session(self, session_key: str) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         db_end_session_id = None
@@ -829,6 +855,7 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                service_tier_override=None,
             )
 
             self._entries[session_key] = new_entry
@@ -888,6 +915,7 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                service_tier_override=None,
             )
 
             self._entries[session_key] = new_entry

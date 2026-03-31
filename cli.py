@@ -1189,6 +1189,7 @@ class HermesCLI:
         self._providers_order = pr.get("order")
         self._provider_require_params = pr.get("require_parameters", False)
         self._provider_data_collection = pr.get("data_collection")
+        self.codex_service_tier = None
         
         # Fallback provider chain — tried in order when primary fails after retries.
         # Supports new list format (fallback_providers) and legacy single-dict (fallback_model).
@@ -2096,6 +2097,7 @@ class HermesCLI:
                 base_url=runtime.get("base_url"),
                 provider=runtime.get("provider"),
                 api_mode=runtime.get("api_mode"),
+                service_tier=self.codex_service_tier,
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
                 max_iterations=self.max_turns,
@@ -2997,11 +2999,13 @@ class HermesCLI:
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
+        self.codex_service_tier = None
 
         if self.agent:
             self.agent.session_id = self.session_id
             self.agent.session_start = self.session_start
             self.agent.reset_session_state()
+            self.agent.service_tier = None
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = 0
             if hasattr(self.agent, "_todo_store"):
@@ -3069,6 +3073,7 @@ class HermesCLI:
         self.session_id = target_id
         self._resumed = True
         self._pending_title = None
+        self.codex_service_tier = None
 
         # Load conversation history
         restored = self._session_db.get_messages_as_conversation(target_id)
@@ -3084,6 +3089,7 @@ class HermesCLI:
         if self.agent:
             self.agent.session_id = target_id
             self.agent.reset_session_state()
+            self.agent.service_tier = None
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
             if hasattr(self.agent, "_todo_store"):
@@ -3862,6 +3868,8 @@ class HermesCLI:
             self._toggle_verbose()
         elif canonical == "yolo":
             self._toggle_yolo()
+        elif canonical == "fast":
+            self._handle_fast_command(cmd_original)
         elif canonical == "reasoning":
             self._handle_reasoning_command(cmd_original)
         elif canonical == "compress":
@@ -4091,6 +4099,7 @@ class HermesCLI:
                     base_url=turn_route["runtime"].get("base_url"),
                     provider=turn_route["runtime"].get("provider"),
                     api_mode=turn_route["runtime"].get("api_mode"),
+                    service_tier=self.codex_service_tier,
                     acp_command=turn_route["runtime"].get("command"),
                     acp_args=turn_route["runtime"].get("args"),
                     max_iterations=self.max_turns,
@@ -4587,6 +4596,37 @@ class HermesCLI:
         else:
             os.environ["HERMES_YOLO_MODE"] = "1"
             self.console.print("  ⚡ YOLO mode [bold green]ON[/] — all commands auto-approved. Use with caution.")
+
+    def _handle_fast_command(self, cmd: str):
+        """Handle /fast — session-local Codex fast mode."""
+        from hermes_cli.fast_mode import FAST_MODE_USAGE, fast_mode_note, parse_fast_command_arg
+
+        parts = cmd.strip().split(maxsplit=1)
+        action = parse_fast_command_arg(parts[1] if len(parts) > 1 else "")
+        if action is None:
+            _cprint(f"  {_DIM}Usage: {FAST_MODE_USAGE}{_RST}")
+            return
+
+        current_enabled = self.codex_service_tier == "fast"
+        if action == "status":
+            enabled = current_enabled
+        elif action == "toggle":
+            enabled = not current_enabled
+        else:
+            enabled = action == "on"
+
+        if action != "status":
+            self.codex_service_tier = "fast" if enabled else None
+            if self.agent:
+                self.agent.service_tier = self.codex_service_tier
+
+        provider = getattr(self.agent, "provider", None) if self.agent else getattr(self, "provider", None)
+        model = getattr(self.agent, "model", None) if self.agent else getattr(self, "model", None)
+        state = "ON ✓" if enabled else "off"
+        _cprint(f"  {_GOLD}Fast mode: {state}{_RST}")
+        _cprint(f"  {_DIM}{fast_mode_note(provider=provider, model=model, enabled=enabled)}{_RST}")
+        if action != "status":
+            _cprint(f"  {_DIM}Takes effect on the next message.{_RST}")
 
     def _handle_reasoning_command(self, cmd: str):
         """Handle /reasoning — manage effort level and display toggle.
