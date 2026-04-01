@@ -284,12 +284,6 @@ TOOLSETS = {
         ],
         "includes": []
     },
-
-    "hermes-cli-lean": {
-        "description": "Lean interactive CLI default — local coding tools plus memory/search and clarify, with explicit skill slash commands for richer workflows",
-        "tools": [],
-        "includes": ["terminal", "file", "todo", "memory", "session_search", "clarify"]
-    },
     
     "hermes-cli": {
         "description": "Full interactive CLI toolset - all default tools plus cronjob management",
