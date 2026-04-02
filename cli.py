@@ -1417,6 +1417,7 @@ class HermesCLI:
         self.api_mode = "chat_completions"
         self.acp_command: Optional[str] = None
         self.acp_args: list[str] = []
+        self.codex_service_tier = None
         self.base_url = (
             base_url
             or CLI_CONFIG["model"].get("base_url", "")
@@ -1557,6 +1558,7 @@ class HermesCLI:
         self._command_status = ""
         self._attached_images: list[Path] = []
         self._image_counter = 0
+        self._last_assistant_message_text: str = ""
         self.preloaded_skills: list[str] = []
         self._startup_skills_line_shown = False
 
@@ -2442,6 +2444,7 @@ class HermesCLI:
                 base_url=runtime.get("base_url"),
                 provider=runtime.get("provider"),
                 api_mode=runtime.get("api_mode"),
+                service_tier=self.codex_service_tier,
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
@@ -2812,6 +2815,50 @@ class HermesCLI:
             return True
         self._image_counter -= 1
         return False
+
+    @staticmethod
+    def _assistant_copy_shortcut_label() -> str:
+        return "Alt+C"
+
+    @classmethod
+    def _assistant_copy_hint_text(cls) -> str:
+        return f"  ⧉ {cls._assistant_copy_shortcut_label()} copy latest reply"
+
+    def _remember_assistant_message(self, text: Optional[str]) -> None:
+        """Store the latest assistant-visible message for clipboard copying."""
+        plain = _rich_text_from_ansi(text or "").plain
+        if plain.strip():
+            self._last_assistant_message_text = plain
+
+    def _show_assistant_copy_hint(self) -> None:
+        if not getattr(self, "_app", None):
+            return
+        ChatConsole().print(f"[dim]{_escape(self._assistant_copy_hint_text())}[/]")
+
+    def _copy_latest_assistant_message(self) -> tuple[bool, str]:
+        """Copy the latest assistant reply shown in the interactive chat."""
+        latest = getattr(self, "_last_assistant_message_text", "")
+        if not latest.strip():
+            return False, "No assistant reply yet to copy."
+
+        from hermes_cli.clipboard import copy_text_to_clipboard
+
+        ok, error = copy_text_to_clipboard(latest)
+        if ok:
+            return True, "Copied latest assistant reply to the system clipboard."
+        if error:
+            return False, f"Clipboard copy failed: {error}"
+        return False, "Clipboard copy failed."
+
+    def _register_copy_shortcut(self, kb: KeyBindings) -> None:
+        """Bind Alt+C to copy the latest assistant reply."""
+
+        @kb.add('escape', 'c')
+        def handle_copy_latest_reply(event):
+            ok, message = self._copy_latest_assistant_message()
+            icon = "⧉" if ok else "⚠"
+            _cprint(f"  {_DIM}{icon} {message}{_RST}")
+            event.app.invalidate()
 
     def _handle_rollback_command(self, command: str):
         """Handle /rollback — list, diff, or restore filesystem checkpoints.
@@ -3455,11 +3502,13 @@ class HermesCLI:
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
+        self.codex_service_tier = None
 
         if self.agent:
             self.agent.session_id = self.session_id
             self.agent.session_start = self.session_start
             self.agent.reset_session_state()
+            self.agent.service_tier = None
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = 0
             if hasattr(self.agent, "_todo_store"):
@@ -3530,6 +3579,7 @@ class HermesCLI:
         self.session_id = target_id
         self._resumed = True
         self._pending_title = None
+        self.codex_service_tier = None
 
         # Load conversation history (strip transcript-only metadata entries)
         restored = self._session_db.get_messages_as_conversation(target_id)
@@ -3546,6 +3596,7 @@ class HermesCLI:
         if self.agent:
             self.agent.session_id = target_id
             self.agent.reset_session_state()
+            self.agent.service_tier = None
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
             if hasattr(self.agent, "_todo_store"):
@@ -4594,6 +4645,8 @@ class HermesCLI:
             self._toggle_verbose()
         elif canonical == "yolo":
             self._toggle_yolo()
+        elif canonical == "fast":
+            self._handle_fast_command(cmd_original)
         elif canonical == "reasoning":
             self._handle_reasoning_command(cmd_original)
         elif canonical == "compress":
@@ -4823,6 +4876,7 @@ class HermesCLI:
                     base_url=turn_route["runtime"].get("base_url"),
                     provider=turn_route["runtime"].get("provider"),
                     api_mode=turn_route["runtime"].get("api_mode"),
+                    service_tier=self.codex_service_tier,
                     acp_command=turn_route["runtime"].get("command"),
                     acp_args=turn_route["runtime"].get("args"),
                     max_iterations=self.max_turns,
@@ -4875,6 +4929,7 @@ class HermesCLI:
                 _cprint(f"  Prompt: \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
                 ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
                 if response:
+                    self._remember_assistant_message(response)
                     try:
                         from hermes_cli.skin_engine import get_active_skin
                         _skin = get_active_skin()
@@ -4896,6 +4951,7 @@ class HermesCLI:
                         box=rich_box.HORIZONTALS,
                         padding=(1, 2),
                     ))
+                    self._show_assistant_copy_hint()
                 else:
                     _cprint("  (No response generated)")
 
@@ -5003,6 +5059,7 @@ class HermesCLI:
                 print()
 
                 if response:
+                    self._remember_assistant_message(response)
                     try:
                         from hermes_cli.skin_engine import get_active_skin
                         _skin = get_active_skin()
@@ -5018,6 +5075,7 @@ class HermesCLI:
                         box=rich_box.HORIZONTALS,
                         padding=(1, 2),
                     ))
+                    self._show_assistant_copy_hint()
                 else:
                     _cprint("  💬 /btw: (no response)")
 
@@ -5307,6 +5365,37 @@ class HermesCLI:
         else:
             os.environ["HERMES_YOLO_MODE"] = "1"
             self.console.print("  ⚡ YOLO mode [bold green]ON[/] — all commands auto-approved. Use with caution.")
+
+    def _handle_fast_command(self, cmd: str):
+        """Handle /fast — session-local Codex fast mode."""
+        from hermes_cli.fast_mode import FAST_MODE_USAGE, fast_mode_note, parse_fast_command_arg
+
+        parts = cmd.strip().split(maxsplit=1)
+        action = parse_fast_command_arg(parts[1] if len(parts) > 1 else "")
+        if action is None:
+            _cprint(f"  {_DIM}Usage: {FAST_MODE_USAGE}{_RST}")
+            return
+
+        current_enabled = self.codex_service_tier == "fast"
+        if action == "status":
+            enabled = current_enabled
+        elif action == "toggle":
+            enabled = not current_enabled
+        else:
+            enabled = action == "on"
+
+        if action != "status":
+            self.codex_service_tier = "fast" if enabled else None
+            if self.agent:
+                self.agent.service_tier = self.codex_service_tier
+
+        provider = getattr(self.agent, "provider", None) if self.agent else getattr(self, "provider", None)
+        model = getattr(self.agent, "model", None) if self.agent else getattr(self, "model", None)
+        state = "ON ✓" if enabled else "off"
+        _cprint(f"  {_GOLD}Fast mode: {state}{_RST}")
+        _cprint(f"  {_DIM}{fast_mode_note(provider=provider, model=model, enabled=enabled)}{_RST}")
+        if action != "status":
+            _cprint(f"  {_DIM}Takes effect on the next message.{_RST}")
 
     def _handle_reasoning_command(self, cmd: str):
         """Handle /reasoning — manage effort level and display toggle.
@@ -6776,6 +6865,8 @@ class HermesCLI:
                     response = response + "\n\n---\n_[Interrupted - processing new message]_"
 
             response_previewed = result.get("response_previewed", False) if result else False
+            if response:
+                self._remember_assistant_message(response)
 
             # Display reasoning (thinking) box if enabled and available.
             # Skip when streaming already showed reasoning live.  Use the
@@ -6836,6 +6927,8 @@ class HermesCLI:
                         padding=(1, 2),
                     ))
 
+            if response:
+                self._show_assistant_copy_hint()
 
             # Play terminal bell when agent finishes (if enabled).
             # Works over SSH — the bell propagates to the user's terminal.
@@ -7226,6 +7319,7 @@ class HermesCLI:
         
         # Key bindings for the input area
         kb = KeyBindings()
+        self._register_copy_shortcut(kb)
         
         @kb.add('enter')
         def handle_enter(event):

@@ -19,6 +19,8 @@ from typing import Any
 from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.completion import Completer, Completion
 
+from hermes_cli.fast_mode import FAST_MODE_SUBCOMMANDS
+
 
 # ---------------------------------------------------------------------------
 # CommandDef dataclass
@@ -87,6 +89,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("model", "Switch model for this session", "Configuration", args_hint="[model] [--global]"),
     CommandDef("provider", "Show available providers and current provider",
                "Configuration"),
+    CommandDef("fast", "Toggle Codex fast mode", "Configuration",
+               args_hint="[on|off|status]", subcommands=FAST_MODE_SUBCOMMANDS),
     CommandDef("prompt", "View/set custom system prompt", "Configuration",
                cli_only=True, args_hint="[text]", subcommands=("clear",)),
     CommandDef("personality", "Set a predefined personality", "Configuration",
