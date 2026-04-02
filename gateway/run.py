@@ -2062,6 +2062,9 @@ class GatewayRunner:
         if canonical == "reasoning":
             return await self._handle_reasoning_command(event)
 
+        if canonical == "fast":
+            return await self._handle_fast_command(event)
+
         if canonical == "verbose":
             return await self._handle_verbose_command(event)
 
@@ -4819,6 +4822,36 @@ class GatewayRunner:
             except Exception:
                 pass
 
+    async def _handle_fast_command(self, event: MessageEvent) -> str:
+        """Handle /fast — session-local Codex fast mode."""
+        from hermes_cli.fast_mode import FAST_MODE_USAGE, fast_mode_note, parse_fast_command_arg
+
+        action = parse_fast_command_arg(event.get_command_args())
+        if action is None:
+            return f"⚡ Usage: `{FAST_MODE_USAGE}`"
+
+        session_entry = self.session_store.get_or_create_session(event.source)
+        current_enabled = getattr(session_entry, "service_tier_override", None) == "fast"
+
+        if action == "status":
+            enabled = current_enabled
+        elif action == "toggle":
+            enabled = not current_enabled
+        else:
+            enabled = action == "on"
+
+        if action != "status":
+            self.session_store.set_service_tier_override(
+                session_entry.session_key,
+                "fast" if enabled else None,
+            )
+
+        state = "on ✓" if enabled else "off"
+        lines = [f"⚡ **Fast mode:** {state}", f"_{fast_mode_note(enabled=enabled)}_"]
+        if action != "status":
+            lines.append("_(takes effect on next message)_")
+        return "\n".join(lines)
+
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.
 
@@ -6615,6 +6648,9 @@ class GatewayRunner:
                 }
 
             pr = self._provider_routing
+            honcho_manager, honcho_config = self._get_or_create_gateway_honcho(session_key)
+            session_entry = self.session_store.get_session(session_key) if getattr(self, "session_store", None) else None
+            service_tier = getattr(session_entry, "service_tier_override", None)
             reasoning_config = self._load_reasoning_config()
             self._reasoning_config = reasoning_config
             # Set up streaming consumer if enabled
@@ -6672,6 +6708,7 @@ class GatewayRunner:
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
+                    service_tier=service_tier,
                     max_iterations=max_iterations,
                     quiet_mode=True,
                     verbose_logging=False,
@@ -6703,6 +6740,7 @@ class GatewayRunner:
             agent.stream_delta_callback = _stream_delta_cb
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
+            agent.service_tier = service_tier
 
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:

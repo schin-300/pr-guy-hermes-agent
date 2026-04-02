@@ -73,6 +73,7 @@ from tools.browser_tool import cleanup_browser
 
 
 from hermes_constants import OPENROUTER_BASE_URL
+from hermes_cli.fast_mode import normalize_service_tier, responses_api_service_tier
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import build_memory_context_block
@@ -490,6 +491,7 @@ class AIAgent:
         tool_gen_callback: callable = None,
         status_callback: callable = None,
         max_tokens: int = None,
+        service_tier: str = None,
         reasoning_config: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
@@ -559,6 +561,7 @@ class AIAgent:
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self._user_id = user_id  # Platform user identifier (gateway sessions)
+        self.service_tier = normalize_service_tier(service_tier)
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
         # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -3272,6 +3275,7 @@ class AIAgent:
             "model", "instructions", "input", "tools", "store",
             "reasoning", "include", "max_output_tokens", "temperature",
             "tool_choice", "parallel_tool_calls", "prompt_cache_key",
+            "service_tier",
         }
         normalized: Dict[str, Any] = {
             "model": model,
@@ -3303,6 +3307,12 @@ class AIAgent:
             val = api_kwargs.get(passthrough_key)
             if val is not None:
                 normalized[passthrough_key] = val
+
+        service_tier = api_kwargs.get("service_tier")
+        if service_tier is not None:
+            if not isinstance(service_tier, str) or service_tier not in {"priority", "flex"}:
+                raise ValueError("Codex Responses 'service_tier' must be 'priority' or 'flex' when set.")
+            normalized["service_tier"] = service_tier
 
         if allow_stream:
             stream = api_kwargs.get("stream")
@@ -5371,6 +5381,15 @@ class AIAgent:
 
             if not is_github_responses:
                 kwargs["prompt_cache_key"] = self.session_id
+
+            api_service_tier = responses_api_service_tier(self.service_tier)
+            if api_service_tier and not is_github_responses:
+                base_url_lower = (self.base_url or "").lower()
+                if (
+                    self._is_direct_openai_url(self.base_url)
+                    or "chatgpt.com/backend-api/codex" in base_url_lower
+                ):
+                    kwargs["service_tier"] = api_service_tier
 
             if reasoning_enabled:
                 if is_github_responses:

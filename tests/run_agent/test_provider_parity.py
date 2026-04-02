@@ -374,6 +374,42 @@ class TestBuildApiKwargsCodex:
         assert "name" in tools[0]
         assert "function" not in tools[0]
 
+    def test_fast_service_tier_maps_to_priority(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        agent.service_tier = "fast"
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert kwargs["service_tier"] == "priority"
+
+    def test_non_openai_responses_route_omits_service_tier(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "custom", api_mode="codex_responses",
+                            base_url="https://example.invalid/v1")
+        agent.service_tier = "fast"
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert "service_tier" not in kwargs
+
+    def test_openai_codex_provider_on_openrouter_omits_service_tier(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://openrouter.ai/api/v1")
+        agent.service_tier = "fast"
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert "service_tier" not in kwargs
+
+    def test_preflight_accepts_priority_service_tier(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        normalized = agent._preflight_codex_api_kwargs(
+            {
+                "model": "gpt-5.4",
+                "instructions": "be helpful",
+                "input": [{"role": "user", "content": "hi"}],
+                "tools": [],
+                "store": False,
+                "service_tier": "priority",
+            }
+        )
+        assert normalized["service_tier"] == "priority"
+
 
 # ── Message conversion tests ────────────────────────────────────────────────
 
