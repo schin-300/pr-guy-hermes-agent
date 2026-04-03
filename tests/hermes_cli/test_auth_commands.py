@@ -184,6 +184,41 @@ def test_auth_add_codex_oauth_persists_pool_entry(tmp_path, monkeypatch):
     assert entry["base_url"] == "https://chatgpt.com/backend-api/codex"
 
 
+def test_auth_add_codex_oauth_preserves_optional_account_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+    token = _jwt_with_email("codex-meta@example.com")
+    monkeypatch.setattr(
+        "hermes_cli.auth._codex_device_code_login",
+        lambda: {
+            "tokens": {
+                "access_token": token,
+                "refresh_token": "refresh-token",
+                "account_id": "acct-42",
+                "id_token": "id-token-42",
+            },
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "last_refresh": "2026-03-23T10:00:00Z",
+        },
+    )
+
+    from hermes_cli.auth_commands import auth_add_command
+
+    class _Args:
+        provider = "openai-codex"
+        auth_type = "oauth"
+        api_key = None
+        label = None
+
+    auth_add_command(_Args())
+
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entry = payload["credential_pool"]["openai-codex"][0]
+    assert entry["label"] == "codex-meta@example.com"
+    assert entry["account_id"] == "acct-42"
+    assert entry["id_token"] == "id-token-42"
+
+
 def test_auth_remove_reindexes_priorities(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     # Prevent pool auto-seeding from host env vars and file-backed sources

@@ -234,18 +234,22 @@ def auth_add_command(args) -> None:
             creds["tokens"]["access_token"],
             _oauth_default_label(provider, len(pool.entries()) + 1),
         )
-        entry = PooledCredential(
-            provider=provider,
-            id=uuid.uuid4().hex[:6],
-            label=label,
-            auth_type=AUTH_TYPE_OAUTH,
-            priority=0,
-            source=f"{SOURCE_MANUAL}:device_code",
-            access_token=creds["tokens"]["access_token"],
-            refresh_token=creds["tokens"].get("refresh_token"),
-            base_url=creds.get("base_url"),
-            last_refresh=creds.get("last_refresh"),
-        )
+        payload = {
+            "id": uuid.uuid4().hex[:6],
+            "label": label,
+            "auth_type": AUTH_TYPE_OAUTH,
+            "priority": 0,
+            "source": f"{SOURCE_MANUAL}:device_code",
+            "access_token": creds["tokens"]["access_token"],
+            "refresh_token": creds["tokens"].get("refresh_token"),
+            "base_url": creds.get("base_url"),
+            "last_refresh": creds.get("last_refresh"),
+        }
+        for extra_key in ("account_id", "id_token"):
+            extra_value = creds["tokens"].get(extra_key)
+            if isinstance(extra_value, str) and extra_value.strip():
+                payload[extra_key] = extra_value.strip()
+        entry = PooledCredential.from_dict(provider, payload)
         pool.add_entry(entry)
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
         return
@@ -533,6 +537,11 @@ def auth_command(args) -> None:
         return
     if action == "reset":
         auth_reset_command(args)
+        return
+    if action in {"view", "tui"}:
+        from hermes_cli.auth_tui import auth_view_command
+
+        auth_view_command(args)
         return
     # No subcommand — launch interactive mode
     _interactive_auth()

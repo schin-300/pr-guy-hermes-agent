@@ -4205,6 +4205,7 @@ Examples:
     hermes logout                 Clear stored authentication
     hermes auth add <provider>    Add a pooled credential
     hermes auth list              List pooled credentials
+    hermes auth view              Open compact Codex auth TUI
     hermes auth remove <p> <t>    Remove pooled credential by index, id, or label
     hermes auth reset <provider>  Clear exhaustion status for a provider
     hermes model                  Select default model
@@ -4597,12 +4598,24 @@ For more help on a command:
     auth_add.add_argument("--timeout", type=float, help="OAuth/network timeout in seconds")
     auth_add.add_argument("--insecure", action="store_true", help="Disable TLS verification for OAuth login")
     auth_add.add_argument("--ca-bundle", help="Custom CA bundle for OAuth login")
-    auth_list = auth_subparsers.add_parser("list", help="List pooled credentials")
+    auth_list=auth_subparsers.add_parser("list", help="List pooled credentials")
     auth_list.add_argument("provider", nargs="?", help="Optional provider filter")
-    auth_remove = auth_subparsers.add_parser("remove", help="Remove a pooled credential by index, id, or label")
+    auth_view=auth_subparsers.add_parser(
+        "view",
+        aliases=["tui"],
+        help="Open a compact Codex auth TUI with live usage bars",
+    )
+    auth_view.add_argument(
+        "--provider",
+        default="openai-codex",
+        help="Auth provider to inspect (currently only openai-codex is supported)",
+    )
+    auth_view.add_argument("--timeout", type=float, default=10.0, help="Per-profile usage request timeout in seconds")
+    auth_view.add_argument("--smoke-test", action="store_true", help="Print a non-interactive snapshot instead of launching curses")
+    auth_remove=auth_subparsers.add_parser("remove", help="Remove a pooled credential by index, id, or label")
     auth_remove.add_argument("provider", help="Provider id")
     auth_remove.add_argument("target", help="Credential index, entry id, or exact label")
-    auth_reset = auth_subparsers.add_parser("reset", help="Clear exhaustion status for all credentials for a provider")
+    auth_reset=auth_subparsers.add_parser("reset", help="Clear exhaustion status for all credentials for a provider")
     auth_reset.add_argument("provider", help="Provider id")
     auth_parser.set_defaults(func=cmd_auth)
 

@@ -2844,11 +2844,17 @@ def _codex_device_code_login() -> Dict[str, Any]:
         or DEFAULT_CODEX_BASE_URL
     )
 
+    token_payload = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+    }
+    for extra_key in ("account_id", "id_token"):
+        extra_value = tokens.get(extra_key)
+        if isinstance(extra_value, str) and extra_value.strip():
+            token_payload[extra_key] = extra_value.strip()
+
     return {
-        "tokens": {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-        },
+        "tokens": token_payload,
         "base_url": base_url,
         "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "auth_mode": "chatgpt",

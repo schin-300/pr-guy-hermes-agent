@@ -33,6 +33,10 @@ from hermes_cli.auth import (
 
 logger = logging.getLogger(__name__)
 
+# Shared in-process lock so separate CredentialPool instances do not clobber each
+# other's auth.json updates. This matters for concurrent UI refresh/remove flows.
+_AUTH_STORE_MUTATION_LOCK = threading.Lock()
+
 
 def _load_config_safe() -> Optional[dict]:
     """Load config.yaml, returning None on any error."""
@@ -81,7 +85,7 @@ CUSTOM_POOL_PREFIX = "custom:"
 _EXTRA_KEYS = frozenset({
     "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
     "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
-    "agent_key_obtained_at", "tls",
+    "agent_key_obtained_at", "tls", "account_id", "id_token",
 })
 
 
@@ -388,6 +392,17 @@ class CredentialPool:
             self.provider,
             [entry.to_dict() for entry in self._entries],
         )
+
+    def _load_latest_entries(self) -> List[PooledCredential]:
+        payloads = read_credential_pool(self.provider)
+        entries = [PooledCredential.from_dict(self.provider, payload) for payload in payloads]
+        entries.sort(key=lambda item: item.priority)
+        return entries
+
+    def _sync_from_latest(self, entries: List[PooledCredential]) -> None:
+        self._entries = sorted(entries, key=lambda item: item.priority)
+        if self._current_id and not any(entry.id == self._current_id for entry in self._entries):
+            self._current_id = None
 
     def _mark_exhausted(
         self,
@@ -850,15 +865,65 @@ class CredentialPool:
     def remove_index(self, index: int) -> Optional[PooledCredential]:
         if index < 1 or index > len(self._entries):
             return None
-        removed = self._entries.pop(index - 1)
-        self._entries = [
-            replace(entry, priority=new_priority)
-            for new_priority, entry in enumerate(self._entries)
-        ]
-        self._persist()
-        if self._current_id == removed.id:
-            self._current_id = None
-        return removed
+        entry_id = self._entries[index - 1].id
+        return self.remove_entry(entry_id)
+
+    def remove_entry(self, entry_id: str) -> Optional[PooledCredential]:
+        with self._lock, _AUTH_STORE_MUTATION_LOCK:
+            latest_entries = self._load_latest_entries()
+            removed = next((entry for entry in latest_entries if entry.id == entry_id), None)
+            if removed is None:
+                self._sync_from_latest(latest_entries)
+                return None
+
+            remaining = [entry for entry in latest_entries if entry.id != entry_id]
+            remaining = [
+                replace(entry, priority=new_priority)
+                for new_priority, entry in enumerate(remaining)
+            ]
+            write_credential_pool(
+                self.provider,
+                [entry.to_dict() for entry in remaining],
+            )
+            self._sync_from_latest(remaining)
+            return removed
+
+    def update_entry(self, entry_id: str, **updates: Any) -> Optional[PooledCredential]:
+        """Update one entry by id, persist it, and return the updated credential."""
+        with self._lock, _AUTH_STORE_MUTATION_LOCK:
+            latest_entries = self._load_latest_entries()
+            for idx, entry in enumerate(latest_entries):
+                if entry.id != entry_id:
+                    continue
+
+                field_names = {f.name for f in fields(entry)}
+                field_updates: Dict[str, Any] = {}
+                extra_updates = dict(entry.extra)
+                for key, value in updates.items():
+                    if key == "provider":
+                        continue
+                    if key in field_names:
+                        field_updates[key] = value
+                    elif key in _EXTRA_KEYS:
+                        extra_updates[key] = value
+                if extra_updates != entry.extra:
+                    field_updates["extra"] = extra_updates
+
+                if not field_updates:
+                    self._sync_from_latest(latest_entries)
+                    return entry
+
+                updated = replace(entry, **field_updates)
+                latest_entries[idx] = updated
+                write_credential_pool(
+                    self.provider,
+                    [item.to_dict() for item in latest_entries],
+                )
+                self._sync_from_latest(latest_entries)
+                return updated
+
+            self._sync_from_latest(latest_entries)
+        return None
 
     def resolve_target(self, target: Any) -> Tuple[Optional[int], Optional[PooledCredential], Optional[str]]:
         raw = str(target or "").strip()
@@ -886,10 +951,16 @@ class CredentialPool:
         return None, None, f'No credential matching "{raw}".'
 
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
-        entry = replace(entry, priority=_next_priority(self._entries))
-        self._entries.append(entry)
-        self._persist()
-        return entry
+        with self._lock, _AUTH_STORE_MUTATION_LOCK:
+            latest_entries = self._load_latest_entries()
+            updated_entry = replace(entry, priority=_next_priority(latest_entries))
+            latest_entries.append(updated_entry)
+            write_credential_pool(
+                self.provider,
+                [item.to_dict() for item in latest_entries],
+            )
+            self._sync_from_latest(latest_entries)
+            return updated_entry
 
 
 def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, payload: Dict[str, Any]) -> bool:
@@ -1031,6 +1102,8 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                     "auth_type": AUTH_TYPE_OAUTH,
                     "access_token": tokens.get("access_token", ""),
                     "refresh_token": tokens.get("refresh_token"),
+                    "account_id": tokens.get("account_id"),
+                    "id_token": tokens.get("id_token"),
                     "base_url": "https://chatgpt.com/backend-api/codex",
                     "last_refresh": state.get("last_refresh"),
                     "label": label_from_token(tokens.get("access_token", ""), "device_code"),
