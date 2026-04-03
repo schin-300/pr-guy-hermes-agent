@@ -3206,6 +3206,51 @@ class HermesCLI:
         self._image_counter -= 1
         return False
 
+    @staticmethod
+    def _assistant_copy_shortcut_label() -> str:
+        return "Alt+C"
+
+    @classmethod
+    def _assistant_copy_hint_text(cls) -> str:
+        return f"  ⧉ {cls._assistant_copy_shortcut_label()} copy latest reply"
+
+    def _remember_assistant_message(self, text: Optional[str]) -> None:
+        """Store and publish the latest assistant-visible message."""
+        plain = _rich_text_from_ansi(text or "").plain
+        if plain.strip():
+            self._last_assistant_message_text = plain
+            self._publish_latest_reply_to_overlay(plain)
+
+    def _show_assistant_copy_hint(self) -> None:
+        if not getattr(self, "_app", None):
+            return
+        ChatConsole().print(f"[dim]{_escape(self._assistant_copy_hint_text())}[/]")
+
+    def _copy_latest_assistant_message(self) -> tuple[bool, str]:
+        """Copy the latest assistant reply shown in the interactive chat."""
+        latest = getattr(self, "_last_assistant_message_text", "")
+        if not latest.strip():
+            return False, "No assistant reply yet to copy."
+
+        from hermes_cli.clipboard import copy_text_to_clipboard
+
+        ok, error = copy_text_to_clipboard(latest)
+        if ok:
+            return True, "Copied latest assistant reply to the system clipboard."
+        if error:
+            return False, f"Clipboard copy failed: {error}"
+        return False, "Clipboard copy failed."
+
+    def _register_copy_shortcut(self, kb: KeyBindings) -> None:
+        """Bind Alt+C to copy the latest assistant reply."""
+
+        @kb.add('escape', 'c')
+        def handle_copy_latest_reply(event):
+            ok, message = self._copy_latest_assistant_message()
+            icon = "⧉" if ok else "⚠"
+            _cprint(f"  {_DIM}{icon} {message}{_RST}")
+            event.app.invalidate()
+
     def _handle_rollback_command(self, command: str):
         """Handle /rollback — list, diff, or restore filesystem checkpoints.
 

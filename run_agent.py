@@ -730,7 +730,8 @@ class AIAgent:
         self.stream_delta_callback = stream_delta_callback
         self.status_callback = status_callback
         self.tool_gen_callback = tool_gen_callback
-
+        self._last_reported_tool = None  # Track for "new tool" mode
+        self._credential_pool_401_refresh_attempted_ids = set()
         
         # Tool execution state — allows _vprint during tool execution
         # even when stream consumers are registered (no tokens streaming then)
@@ -4524,9 +4525,56 @@ class AIAgent:
             return False, True
 
         if effective_reason == FailoverReason.auth:
+            pool_provider = getattr(pool, "provider", "")
+            current_entry_getter = getattr(pool, "current", None)
+            current_entry = current_entry_getter() if callable(current_entry_getter) else None
+            current_id = getattr(current_entry, "id", None)
+            refreshed_401_ids = getattr(self, "_credential_pool_401_refresh_attempted_ids", None)
+            if not isinstance(refreshed_401_ids, set):
+                refreshed_401_ids = set()
+                self._credential_pool_401_refresh_attempted_ids = refreshed_401_ids
+
+            if status_code == 401 and current_id and current_id in refreshed_401_ids:
+                if pool_provider == "openai-codex":
+                    self._emit_status("🔁 Codex auth still failing after refresh — switching accounts...")
+                elif pool_provider == "anthropic":
+                    self._emit_status("🔁 Anthropic auth still failing after refresh — switching credentials...")
+                elif pool_provider == "nous":
+                    self._emit_status("🔁 Nous auth still failing after refresh — switching credentials...")
+                else:
+                    self._emit_status("🔁 Provider auth still failing after refresh — switching credentials...")
+
+                next_entry = pool.mark_exhausted_and_rotate(status_code=401)
+                if next_entry is not None:
+                    logger.info(
+                        "Credential 401 persisted after refresh — rotated from pool entry %s to %s",
+                        current_id or "?",
+                        getattr(next_entry, "id", "?"),
+                    )
+                    refreshed_401_ids.discard(current_id)
+                    self._swap_credential(next_entry)
+                    return True, False
+                return False, has_retried_429
+
+            if status_code == 401:
+                if pool_provider == "openai-codex":
+                    self._emit_status("🔐 Refreshing Codex auth after 401...")
+                elif pool_provider == "anthropic":
+                    self._emit_status("🔐 Refreshing Anthropic credentials after 401...")
+                elif pool_provider == "nous":
+                    self._emit_status("🔐 Refreshing Nous credentials after 401...")
+                else:
+                    self._emit_status("🔐 Refreshing provider credentials after 401...")
             refreshed = pool.try_refresh_current()
             if refreshed is not None:
-                logger.info(f"Credential auth failure — refreshed pool entry {getattr(refreshed, 'id', '?')}")
+                refreshed_id = getattr(refreshed, "id", None) or current_id
+                if status_code == 401 and refreshed_id:
+                    refreshed_401_ids.add(refreshed_id)
+                logger.info(
+                    "Credential %s failure — refreshed pool entry %s",
+                    status_code or "auth",
+                    getattr(refreshed, "id", "?"),
+                )
                 self._swap_credential(refreshed)
                 return True, has_retried_429
             # Refresh failed — rotate to next credential instead of giving up.
@@ -4539,6 +4587,8 @@ class AIAgent:
                     rotate_status,
                     getattr(next_entry, "id", "?"),
                 )
+                if current_id:
+                    refreshed_401_ids.discard(current_id)
                 self._swap_credential(next_entry)
                 return True, False
 
@@ -7884,11 +7934,12 @@ class AIAgent:
             max_retries = 3
             primary_recovery_attempted = False
             max_compression_attempts = 3
-            codex_auth_retry_attempted=False
-            anthropic_auth_retry_attempted=False
-            nous_auth_retry_attempted=False
+            codex_auth_retry_attempted = False
+            anthropic_auth_retry_attempted = False
+            nous_auth_retry_attempted = False
             thinking_sig_retry_attempted = False
             has_retried_429 = False
+            self._credential_pool_401_refresh_attempted_ids.clear()
             restart_with_compressed_messages = False
             restart_with_length_continuation = False
 
@@ -8507,6 +8558,7 @@ class AIAgent:
                     if (
                         self.api_mode == "codex_responses"
                         and self.provider == "openai-codex"
+                        and self._credential_pool is None
                         and status_code == 401
                         and not codex_auth_retry_attempted
                     ):
@@ -8517,6 +8569,7 @@ class AIAgent:
                     if (
                         self.api_mode == "chat_completions"
                         and self.provider == "nous"
+                        and self._credential_pool is None
                         and status_code == 401
                         and not nous_auth_retry_attempted
                     ):
@@ -8526,6 +8579,7 @@ class AIAgent:
                             continue
                     if (
                         self.api_mode == "anthropic_messages"
+                        and self._credential_pool is None
                         and status_code == 401
                         and hasattr(self, '_anthropic_api_key')
                         and not anthropic_auth_retry_attempted
