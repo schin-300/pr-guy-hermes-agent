@@ -2820,10 +2820,11 @@ class HermesCLI:
         return f"  ⧉ {cls._assistant_copy_shortcut_label()} copy latest reply"
 
     def _remember_assistant_message(self, text: Optional[str]) -> None:
-        """Store the latest assistant-visible message for clipboard copying."""
+        """Store and publish the latest assistant-visible message."""
         plain = _rich_text_from_ansi(text or "").plain
         if plain.strip():
             self._last_assistant_message_text = plain
+            self._publish_latest_reply_to_overlay(plain)
 
     def _show_assistant_copy_hint(self) -> None:
         if not getattr(self, "_app", None):
