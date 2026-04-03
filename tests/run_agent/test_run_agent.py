@@ -2252,6 +2252,47 @@ class TestCredentialPoolRecovery:
         assert captured["status_code"] == 429
         assert captured["error_context"]["reason"] == "device_code_exhausted"
 
+    def test_recover_with_pool_rotates_after_same_credential_401s_twice(self, agent):
+        """A pooled credential should only get one refresh attempt per request."""
+        current = SimpleNamespace(label="primary", id="abc")
+        refreshed_entry = SimpleNamespace(label="refreshed-primary", id="abc")
+        next_entry = SimpleNamespace(label="secondary", id="def")
+
+        pool = MagicMock()
+        pool.provider = "openai-codex"
+        pool.current.return_value = current
+        pool.try_refresh_current.return_value = refreshed_entry
+        pool.mark_exhausted_and_rotate.return_value = next_entry
+
+        agent._credential_pool = pool
+        agent._swap_credential = MagicMock()
+        agent._emit_status = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=401,
+            has_retried_429=False,
+        )
+
+        assert recovered is True
+        assert retry_same is False
+        assert agent._credential_pool_401_refresh_attempted_ids == {"abc"}
+        agent._swap_credential.assert_called_once_with(refreshed_entry)
+        pool.try_refresh_current.assert_called_once()
+        pool.mark_exhausted_and_rotate.assert_not_called()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=401,
+            has_retried_429=False,
+        )
+
+        assert recovered is True
+        assert retry_same is False
+        assert agent._swap_credential.call_count == 2
+        assert agent._swap_credential.call_args_list[1].args == (next_entry,)
+        pool.try_refresh_current.assert_called_once()
+        pool.mark_exhausted_and_rotate.assert_called_once_with(status_code=401)
+        assert agent._credential_pool_401_refresh_attempted_ids == set()
+
 
 class TestMaxTokensParam:
     """Verify _max_tokens_param returns the correct key for each provider."""
