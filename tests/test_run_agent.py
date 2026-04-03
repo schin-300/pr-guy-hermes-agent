@@ -1850,6 +1850,155 @@ class TestRetryExhaustion:
         assert "error" in result
         assert "rate limited" in result["error"]
 
+    def test_api_errors_retry_twenty_times_by_default(self, agent):
+        """Main API loop should keep retrying long enough for auth/pool recovery paths."""
+        self._setup_agent(agent)
+        calls = {"api": 0}
+
+        class _RateLimitError(RuntimeError):
+            def __init__(self):
+                super().__init__("rate limited")
+                self.status_code = 429
+
+        def _fake_api_call(api_kwargs):
+            calls["api"] += 1
+            raise _RateLimitError()
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch("run_agent.time", self._make_fast_time_mock()),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert calls["api"] == 20
+        assert result.get("completed") is False
+        assert result.get("failed") is True
+        assert "rate limited" in result["error"]
+
+    def test_402_pool_rotation_still_recovers_with_default_retry_budget(self, agent):
+        """Hermes credential-pool auth should still rotate/retry successfully on 402."""
+        self._setup_agent(agent)
+        calls = {"api": 0}
+        next_entry = SimpleNamespace(label="secondary")
+
+        class _PaymentRequiredError(RuntimeError):
+            def __init__(self):
+                super().__init__("Error code: 402 - credits exhausted")
+                self.status_code = 402
+
+        class _Pool:
+            def mark_exhausted_and_rotate(self, *, status_code):
+                assert status_code == 402
+                return next_entry
+
+        def _fake_api_call(api_kwargs):
+            calls["api"] += 1
+            if calls["api"] == 1:
+                raise _PaymentRequiredError()
+            return _mock_response(
+                content="Recovered after pool rotation",
+                finish_reason="stop",
+            )
+
+        agent._credential_pool = _Pool()
+        agent._swap_credential = MagicMock()
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert calls["api"] == 2
+        agent._swap_credential.assert_called_once_with(next_entry)
+        assert result.get("completed") is True
+        assert result.get("final_response") == "Recovered after pool rotation"
+
+    def test_codex_pool_quota_text_rotates_without_backoff(self, agent):
+        """Codex profile limits should rotate immediately even when the SDK omits status_code."""
+        self._setup_agent(agent)
+        agent.provider = "openai-codex"
+        calls = {"api": 0}
+        next_entry = SimpleNamespace(label="secondary", id="cred-2")
+
+        class _QuotaError(RuntimeError):
+            pass
+
+        def _fake_api_call(api_kwargs):
+            calls["api"] += 1
+            if calls["api"] == 1:
+                raise _QuotaError("usage limit reached for current codex profile")
+            return _mock_response(
+                content="Recovered via secondary Codex profile",
+                finish_reason="stop",
+            )
+
+        pool = MagicMock()
+        pool.provider = "openai-codex"
+        pool.has_available.return_value = True
+        pool.mark_exhausted_and_rotate.return_value = next_entry
+        agent._credential_pool = pool
+        agent._swap_credential = MagicMock()
+        agent._emit_status = MagicMock()
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch("run_agent.time.sleep") as mock_sleep,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert calls["api"] == 2
+        pool.mark_exhausted_and_rotate.assert_called_once_with(status_code=429)
+        agent._swap_credential.assert_called_once_with(next_entry)
+        mock_sleep.assert_not_called()
+        assert result.get("completed") is True
+        assert result.get("final_response") == "Recovered via secondary Codex profile"
+
+    def test_codex_pool_exhaustion_fails_fast_without_backoff(self, agent):
+        """Once every Codex profile is exhausted, fail immediately instead of exponential waiting."""
+        self._setup_agent(agent)
+        agent.provider = "openai-codex"
+        calls = {"api": 0}
+
+        class _QuotaError(RuntimeError):
+            pass
+
+        def _fake_api_call(api_kwargs):
+            calls["api"] += 1
+            raise _QuotaError("usage limit reached for current codex profile")
+
+        pool = MagicMock()
+        pool.provider = "openai-codex"
+        pool.has_available.return_value = False
+        pool.mark_exhausted_and_rotate.return_value = None
+        agent._credential_pool = pool
+        agent._swap_credential = MagicMock()
+        agent._emit_status = MagicMock()
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch("run_agent.time.sleep") as mock_sleep,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert calls["api"] == 1
+        pool.mark_exhausted_and_rotate.assert_called_once_with(status_code=429)
+        mock_sleep.assert_not_called()
+        assert result.get("completed") is False
+        assert result.get("failed") is True
+        assert "All Codex profiles are exhausted" in result.get("final_response", "")
+
 
 # ---------------------------------------------------------------------------
 # Flush sentinel leak
@@ -2041,9 +2190,29 @@ class TestCredentialPoolRecovery:
         assert retry_same is False
         agent._swap_credential.assert_called_once_with(next_entry)
 
+    def test_recover_with_codex_pool_rotates_immediately_on_first_429(self, agent):
+        next_entry = SimpleNamespace(label="secondary")
+        pool = MagicMock()
+        pool.provider = "openai-codex"
+        pool.mark_exhausted_and_rotate.return_value = next_entry
+
+        agent._credential_pool = pool
+        agent._swap_credential = MagicMock()
+        agent._emit_status = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=False,
+        )
+
+        assert recovered is True
+        assert retry_same is False
+        pool.mark_exhausted_and_rotate.assert_called_once_with(status_code=429)
+        agent._swap_credential.assert_called_once_with(next_entry)
+
 
     def test_recover_with_pool_refreshes_on_401(self, agent):
-        """401 with successful refresh should swap to refreshed credential."""
+
         refreshed_entry = SimpleNamespace(label="refreshed-primary", id="abc")
 
         class _Pool:
