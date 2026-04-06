@@ -127,6 +127,10 @@ class HonchoMemoryProvider(MemoryProvider):
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
         self._sync_thread: Optional[threading.Thread] = None
+        self._init_thread: Optional[threading.Thread] = None
+        self._init_lock = threading.Lock()
+        self._pending_sync_turns: list[tuple[str, str]] = []
+        self._pending_sync_lock = threading.Lock()
 
         # B1: recall_mode — set during initialize from config
         self._recall_mode = "hybrid"  # "context", "tools", or "hybrid"
@@ -251,13 +255,61 @@ class HonchoMemoryProvider(MemoryProvider):
                 return
 
             # ----- Eager init (context or hybrid mode) -----
-            self._do_session_init(cfg, session_id, **kwargs)
+            # Honcho can be slow or unavailable, and its SDK defaults to 60s
+            # request timeouts. Run startup in the background so the first
+            # Hermes prompt doesn't appear stuck on "Initializing agent...".
+            with self._init_lock:
+                if self._session_initialized:
+                    return
+                if self._init_thread and self._init_thread.is_alive():
+                    return
+
+                def _run_init() -> None:
+                    try:
+                        self._do_session_init(cfg, session_id, **kwargs)
+                    except Exception as e:
+                        logger.warning("Honcho init failed: %s", e)
+                        self._manager = None
+                    finally:
+                        self._flush_pending_sync_turns()
+
+                self._init_thread = threading.Thread(
+                    target=_run_init,
+                    daemon=True,
+                    name="honcho-init",
+                )
+                self._init_thread.start()
 
         except ImportError:
             logger.debug("honcho-ai package not installed — plugin inactive")
         except Exception as e:
             logger.warning("Honcho init failed: %s", e)
             self._manager = None
+
+    def _flush_pending_sync_turns(self) -> None:
+        """Flush turns queued while background Honcho init was still running."""
+        with self._pending_sync_lock:
+            pending = list(self._pending_sync_turns)
+            self._pending_sync_turns.clear()
+
+        if not pending or not self._manager or not self._session_key:
+            return
+
+        for user_content, assistant_content in pending:
+            try:
+                self._sync_turn_now(user_content, assistant_content)
+            except Exception as e:
+                logger.debug("Honcho delayed sync_turn failed: %s", e)
+
+    def _sync_turn_now(self, user_content: str, assistant_content: str) -> None:
+        """Write a turn to Honcho immediately using the active session."""
+        session = self._manager.get_or_create(self._session_key)
+        msg_limit = self._config.message_max_chars if self._config else 25000
+        for chunk in self._chunk_message(user_content, msg_limit):
+            session.add_message("user", chunk)
+        for chunk in self._chunk_message(assistant_content, msg_limit):
+            session.add_message("assistant", chunk)
+        self._manager._flush_session(session)
 
     def _do_session_init(self, cfg, session_id: str, **kwargs) -> None:
         """Shared session initialization logic for both eager and lazy paths."""
@@ -565,18 +617,14 @@ class HonchoMemoryProvider(MemoryProvider):
         if self._cron_skipped:
             return
         if not self._manager or not self._session_key:
+            if self._init_thread and self._init_thread.is_alive():
+                with self._pending_sync_lock:
+                    self._pending_sync_turns.append((user_content, assistant_content))
             return
-
-        msg_limit = self._config.message_max_chars if self._config else 25000
 
         def _sync():
             try:
-                session = self._manager.get_or_create(self._session_key)
-                for chunk in self._chunk_message(user_content, msg_limit):
-                    session.add_message("user", chunk)
-                for chunk in self._chunk_message(assistant_content, msg_limit):
-                    session.add_message("assistant", chunk)
-                self._manager._flush_session(session)
+                self._sync_turn_now(user_content, assistant_content)
             except Exception as e:
                 logger.debug("Honcho sync_turn failed: %s", e)
 
@@ -641,6 +689,8 @@ class HonchoMemoryProvider(MemoryProvider):
                 return json.dumps({"error": "Honcho session could not be initialized."})
 
         if not self._manager or not self._session_key:
+            if self._init_thread and self._init_thread.is_alive():
+                return json.dumps({"error": "Honcho is still initializing in the background."})
             return json.dumps({"error": "Honcho is not active for this session."})
 
         try:
