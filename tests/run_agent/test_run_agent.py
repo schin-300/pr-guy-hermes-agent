@@ -806,6 +806,14 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["extra_body"]["provider"]["only"] == ["Anthropic"]
 
+    def test_custom_extra_body_forwarded_for_local_openai_routes(self, agent):
+        agent.base_url = "http://127.0.0.1:30121/v1"
+        agent.extra_body_config = {"chat_template_kwargs": {"enable_thinking": False}}
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+        assert "reasoning" not in kwargs["extra_body"]
+
     def test_reasoning_config_default_openrouter(self, agent):
         """Default reasoning config for OpenRouter should be medium."""
         agent.base_url = "https://openrouter.ai/api/v1"

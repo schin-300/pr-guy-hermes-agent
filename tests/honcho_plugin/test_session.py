@@ -1,5 +1,7 @@
 """Tests for plugins/memory/honcho/session.py — HonchoSession and helpers."""
 
+import threading
+import time
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -361,3 +363,90 @@ class TestDialecticInputGuard:
         # The query passed to chat() should be truncated
         actual_query = mock_peer.chat.call_args[0][0]
         assert len(actual_query) <= 100
+
+
+# ---------------------------------------------------------------------------
+# Provider initialization
+# ---------------------------------------------------------------------------
+
+
+class TestHonchoProviderInit:
+    def test_initialize_hybrid_returns_without_waiting_for_honcho(self, monkeypatch):
+        provider = HonchoMemoryProvider()
+        cfg = SimpleNamespace(
+            enabled=True,
+            api_key="test-key",
+            base_url=None,
+            recall_mode="hybrid",
+            raw={},
+        )
+        started = threading.Event()
+        release = threading.Event()
+
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda: cfg,
+        )
+
+        def fake_do_session_init(_cfg, _session_id, **_kwargs):
+            started.set()
+            release.wait(timeout=1.0)
+
+        provider._do_session_init = fake_do_session_init
+
+        start = time.perf_counter()
+        provider.initialize("session-1")
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.2
+        assert started.wait(timeout=0.2)
+        assert provider._init_thread is not None
+        assert provider._init_thread.is_alive()
+
+        release.set()
+        provider._init_thread.join(timeout=1.0)
+
+    def test_sync_turn_queues_while_background_init_is_running(self):
+        provider = HonchoMemoryProvider()
+        provider._init_thread = MagicMock()
+        provider._init_thread.is_alive.return_value = True
+
+        provider.sync_turn("hello", "world")
+
+        assert provider._pending_sync_turns == [("hello", "world")]
+
+    def test_background_init_flushes_queued_turns(self, monkeypatch):
+        provider = HonchoMemoryProvider()
+        cfg = SimpleNamespace(
+            enabled=True,
+            api_key="test-key",
+            base_url=None,
+            recall_mode="hybrid",
+            raw={},
+            message_max_chars=25000,
+        )
+        session = MagicMock()
+        manager = MagicMock()
+        manager.get_or_create.return_value = session
+
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda: cfg,
+        )
+
+        def fake_do_session_init(_cfg, _session_id, **_kwargs):
+            provider._config = cfg
+            provider._manager = manager
+            provider._session_key = "session-1"
+            provider._session_initialized = True
+
+        provider._do_session_init = fake_do_session_init
+        provider._pending_sync_turns.append(("hello", "world"))
+
+        provider.initialize("session-1")
+        provider._init_thread.join(timeout=1.0)
+
+        session.add_message.assert_any_call("user", "hello")
+        session.add_message.assert_any_call("assistant", "world")
+        manager._flush_session.assert_called_once_with(session)
+        assert provider._pending_sync_turns == []

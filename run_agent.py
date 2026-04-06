@@ -472,6 +472,7 @@ class AIAgent:
         max_tokens: int = None,
         service_tier: str = None,
         reasoning_config: Dict[str, Any] = None,
+        extra_body_config: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
@@ -517,6 +518,8 @@ class AIAgent:
             max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
             reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
                 If None, defaults to {"enabled": True, "effort": "medium"} for OpenRouter. Set to disable/customize reasoning.
+            extra_body_config (Dict): Extra OpenAI-compatible request fields to merge into `extra_body` for each call.
+                Useful for local routes that need flags like chat_template_kwargs.enable_thinking=false.
             prefill_messages (List[Dict]): Messages to prepend to conversation history as prefilled context.
                 Useful for injecting a few-shot example or priming the model's response style.
                 Example: [{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hello!"}]
@@ -635,6 +638,7 @@ class AIAgent:
         # Model response configuration
         self.max_tokens = max_tokens  # None = use model default
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
+        self.extra_body_config = copy.deepcopy(extra_body_config or {})
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         
         # Anthropic prompt caching: auto-enabled for Claude models via OpenRouter.
@@ -5551,7 +5555,7 @@ class AIAgent:
             except Exception:
                 pass  # fail open — let OpenRouter pick its default
 
-        extra_body = {}
+        extra_body = copy.deepcopy(self.extra_body_config or {})
 
         _is_openrouter = self._is_openrouter_url()
         _is_github_models = (
