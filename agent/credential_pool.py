@@ -462,14 +462,15 @@ class CredentialPool:
         return entry
 
     def _sync_codex_entry_from_cli(self, entry: PooledCredential) -> PooledCredential:
-        """Sync an openai-codex pool entry from ~/.codex/auth.json if tokens differ.
+        """Sync the singleton openai-codex device_code entry from ~/.codex/auth.json.
 
         OpenAI OAuth refresh tokens are single-use and rotate on every refresh.
-        When the Codex CLI (or another Hermes profile) refreshes its token,
-        the pool entry's refresh_token becomes stale.  This method detects that
-        by comparing against ~/.codex/auth.json and syncing the fresh pair.
+        When the external Codex CLI refreshes its token, Hermes's singleton
+        ``device_code`` credential can become stale. Only that singleton entry is
+        allowed to mirror ~/.codex/auth.json — manually added pooled accounts must
+        remain independent and must never be overwritten by shared CLI state.
         """
-        if self.provider != "openai-codex":
+        if self.provider != "openai-codex" or entry.source != "device_code":
             return entry
         try:
             cli_tokens = _import_codex_cli_tokens()
@@ -478,20 +479,35 @@ class CredentialPool:
             cli_refresh = cli_tokens.get("refresh_token", "")
             cli_access = cli_tokens.get("access_token", "")
             if cli_refresh and cli_refresh != entry.refresh_token:
-                logger.debug("Pool entry %s: syncing tokens from ~/.codex/auth.json (refresh token changed)", entry.id)
+                logger.debug("Pool entry %s: syncing singleton device_code tokens from ~/.codex/auth.json", entry.id)
+                sync_timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                persisted_tokens = {
+                    "access_token": cli_access,
+                    "refresh_token": cli_refresh,
+                }
+                if entry.account_id:
+                    persisted_tokens["account_id"] = entry.account_id
+                if entry.id_token:
+                    persisted_tokens["id_token"] = entry.id_token
+                auth_mod._save_codex_tokens(persisted_tokens, last_refresh=sync_timestamp)
                 updated = replace(
                     entry,
                     access_token=cli_access,
                     refresh_token=cli_refresh,
+                    label=label_from_token(cli_access, entry.label or entry.id),
+                    last_refresh=sync_timestamp,
                     last_status=None,
                     last_status_at=None,
                     last_error_code=None,
+                    last_error_reason=None,
+                    last_error_message=None,
+                    last_error_reset_at=None,
                 )
                 self._replace_entry(entry, updated)
                 self._persist()
                 return updated
         except Exception as exc:
-            logger.debug("Failed to sync from ~/.codex/auth.json: %s", exc)
+            logger.debug("Failed to sync singleton Codex entry from ~/.codex/auth.json: %s", exc)
         return entry
 
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
