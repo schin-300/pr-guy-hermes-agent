@@ -13,12 +13,14 @@ import pytest
 from tools.vision_tools import (
     _validate_image_url,
     _handle_vision_analyze,
+    _detect_image_mime_type,
     _determine_mime_type,
     _image_to_base64_data_url,
     _resize_image_for_vision,
     _is_image_size_error,
     _MAX_BASE64_BYTES,
     _RESIZE_TARGET_BYTES,
+    _rasterize_svg_to_png,
     vision_analyze_tool,
     check_vision_requirements,
     get_debug_session_info,
@@ -164,6 +166,91 @@ class TestImageToBase64DataUrl:
     def test_file_not_found_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             _image_to_base64_data_url(tmp_path / "nonexistent.png")
+
+
+# ---------------------------------------------------------------------------
+# SVG rasterization
+# ---------------------------------------------------------------------------
+
+
+class TestSvgRasterization:
+    def test_detects_svg_content_even_when_extension_is_not_svg(self, tmp_path):
+        svg = tmp_path / "downloaded-image.jpg"
+        svg.write_text("<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12'></svg>", encoding="utf-8")
+
+        assert _detect_image_mime_type(svg) == "image/svg+xml"
+
+    def test_rasterize_svg_to_png_uses_headless_chrome_fallback(self, tmp_path):
+        svg = tmp_path / "diagram.svg"
+        svg.write_text("<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12'></svg>", encoding="utf-8")
+
+        def fake_run(cmd, check, stdout, stderr):
+            out_flag = next(part for part in cmd if part.startswith("--screenshot="))
+            out_path = Path(out_flag.split("=", 1)[1])
+            out_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+            return MagicMock()
+
+        with (
+            patch.dict("sys.modules", {"cairosvg": None}),
+            patch("tools.vision_tools.shutil.which", side_effect=lambda name: "/usr/bin/google-chrome" if name == "google-chrome" else None),
+            patch("tools.vision_tools.subprocess.run", side_effect=fake_run) as mock_run,
+        ):
+            png = _rasterize_svg_to_png(svg)
+
+        assert png.suffix == ".png"
+        assert png.exists()
+        assert png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        assert mock_run.called
+
+    @pytest.mark.asyncio
+    async def test_local_svg_is_rasterized_to_png_before_llm_call(self, tmp_path):
+        svg = tmp_path / "diagram.svg"
+        svg.write_text("<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12'></svg>", encoding="utf-8")
+        rasterized = tmp_path / "diagram.rasterized.png"
+        rasterized.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+
+        mock_response = MagicMock()
+        mock_choice = MagicMock()
+        mock_choice.message.content = "Rendered SVG"
+        mock_response.choices = [mock_choice]
+
+        def fake_data_url(path, mime_type=None):
+            assert path == rasterized
+            assert mime_type == "image/png"
+            return "data:image/png;base64,abc"
+
+        with (
+            patch("tools.vision_tools._rasterize_svg_to_png", return_value=rasterized),
+            patch("tools.vision_tools._image_to_base64_data_url", side_effect=fake_data_url),
+            patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock, return_value=mock_response),
+        ):
+            result = json.loads(await vision_analyze_tool(str(svg), "describe this", "test/model"))
+
+        assert result["success"] is True
+        assert result["analysis"] == "Rendered SVG"
+
+    @pytest.mark.asyncio
+    async def test_local_svg_keeps_source_but_cleans_up_rasterized_png(self, tmp_path):
+        svg = tmp_path / "diagram.svg"
+        svg.write_text("<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12'></svg>", encoding="utf-8")
+        rasterized = tmp_path / "diagram.rasterized.png"
+        rasterized.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+
+        mock_response = MagicMock()
+        mock_choice = MagicMock()
+        mock_choice.message.content = "Rendered SVG"
+        mock_response.choices = [mock_choice]
+
+        with (
+            patch("tools.vision_tools._rasterize_svg_to_png", return_value=rasterized),
+            patch("tools.vision_tools._image_to_base64_data_url", return_value="data:image/png;base64,abc"),
+            patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock, return_value=mock_response),
+        ):
+            result = json.loads(await vision_analyze_tool(str(svg), "describe this", "test/model"))
+
+        assert result["success"] is True
+        assert svg.exists(), "local source SVG should not be deleted"
+        assert not rasterized.exists(), "temporary rasterized PNG should be cleaned up"
 
 
 # ---------------------------------------------------------------------------
