@@ -130,6 +130,23 @@ def get_available_skills() -> Dict[str, List[str]]:
 _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
 
 
+def _git_stdout(repo_dir: Path, *args: str, timeout: float = 5) -> Optional[str]:
+    """Return stripped stdout for a successful git command, else ``None``."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(repo_dir),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
 def check_for_updates() -> Optional[int]:
     """Check how many commits behind origin/main the local repo is.
 
@@ -147,12 +164,16 @@ def check_for_updates() -> Optional[int]:
     if not (repo_dir / ".git").exists():
         return None
 
+    current_head = _git_stdout(repo_dir, "rev-parse", "HEAD")
+
     # Read cache
     now = time.time()
     try:
         if cache_file.exists():
             cached = json.loads(cache_file.read_text())
-            if now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS:
+            cache_is_fresh = now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
+            cache_matches_head = not current_head or cached.get("head") == current_head
+            if cache_is_fresh and cache_matches_head:
                 return cached.get("behind")
     except Exception:
         pass
@@ -183,7 +204,9 @@ def check_for_updates() -> Optional[int]:
 
     # Write cache
     try:
-        cache_file.write_text(json.dumps({"ts": now, "behind": behind}))
+        cache_file.write_text(
+            json.dumps({"ts": now, "behind": behind, "head": current_head})
+        )
     except Exception:
         pass
 

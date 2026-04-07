@@ -1,6 +1,7 @@
 """Tests for the update check mechanism in hermes_cli.banner."""
 
 import json
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -25,14 +26,18 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     (repo_dir / ".git").mkdir()
 
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3}))
+    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3, "head": "abc123"}))
+
+    mock_head = subprocess.CompletedProcess(
+        ["git", "rev-parse", "HEAD"], 0, stdout="abc123\n", stderr=""
+    )
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run") as mock_run:
+    with patch("hermes_cli.banner.subprocess.run", return_value=mock_head) as mock_run:
         result = check_for_updates()
 
     assert result == 3
-    mock_run.assert_not_called()
+    assert mock_run.call_count == 1
 
 
 def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
@@ -47,14 +52,46 @@ def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
     cache_file = tmp_path / ".update_check"
     cache_file.write_text(json.dumps({"ts": 0, "behind": 1}))
 
-    mock_result = MagicMock(returncode=0, stdout="5\n")
+    mock_run_results = [
+        subprocess.CompletedProcess(["git", "rev-parse", "HEAD"], 0, stdout="abc123\n", stderr=""),
+        subprocess.CompletedProcess(["git", "fetch", "origin", "--quiet"], 0, stdout="", stderr=""),
+        subprocess.CompletedProcess(["git", "rev-list", "--count", "HEAD..origin/main"], 0, stdout="5\n", stderr=""),
+    ]
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run:
+    with patch("hermes_cli.banner.subprocess.run", side_effect=mock_run_results) as mock_run:
         result = check_for_updates()
 
     assert result == 5
-    assert mock_run.call_count == 2  # git fetch + git rev-list
+    assert mock_run.call_count == 3  # git rev-parse + git fetch + git rev-list
+
+
+def test_check_for_updates_ignores_fresh_cache_when_head_changes(tmp_path):
+    """Fresh cache should be refreshed after a manual git update changes HEAD."""
+    from hermes_cli.banner import check_for_updates
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 47, "head": "oldsha"}))
+
+    mock_run_results = [
+        subprocess.CompletedProcess(["git", "rev-parse", "HEAD"], 0, stdout="newsha\n", stderr=""),
+        subprocess.CompletedProcess(["git", "fetch", "origin", "--quiet"], 0, stdout="", stderr=""),
+        subprocess.CompletedProcess(["git", "rev-list", "--count", "HEAD..origin/main"], 0, stdout="0\n", stderr=""),
+    ]
+
+    with patch("hermes_cli.banner.os.getenv", return_value=str(tmp_path)):
+        with patch("hermes_cli.banner.subprocess.run", side_effect=mock_run_results) as mock_run:
+            result = check_for_updates()
+
+    assert result == 0
+    assert mock_run.call_count == 3
+    cached = json.loads(cache_file.read_text())
+    assert cached["behind"] == 0
+    assert cached["head"] == "newsha"
 
 
 def test_check_for_updates_no_git_dir(tmp_path, monkeypatch):
