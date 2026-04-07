@@ -391,10 +391,28 @@ class CredentialPool:
                 return
 
     def _persist(self) -> None:
-        write_credential_pool(
-            self.provider,
-            [entry.to_dict() for entry in self._entries],
-        )
+        """Persist in-memory updates without resurrecting entries removed elsewhere.
+
+        Long-lived Hermes processes can hold a stale in-memory pool while another
+        process removes entries from auth.json. Blindly writing ``self._entries``
+        would reintroduce those deleted entries. Instead, merge by id onto the
+        latest on-disk pool and only persist entries that still exist there.
+        """
+        with _AUTH_STORE_MUTATION_LOCK:
+            latest_entries = self._load_latest_entries()
+            latest_by_id = {entry.id: entry for entry in latest_entries}
+            current_by_id = {entry.id: entry for entry in self._entries}
+
+            merged_entries = [
+                current_by_id.get(entry.id, latest_by_id[entry.id])
+                for entry in latest_entries
+            ]
+            merged_entries.sort(key=lambda item: item.priority)
+            write_credential_pool(
+                self.provider,
+                [entry.to_dict() for entry in merged_entries],
+            )
+            self._sync_from_latest(merged_entries)
 
     def _load_latest_entries(self) -> List[PooledCredential]:
         payloads = read_credential_pool(self.provider)

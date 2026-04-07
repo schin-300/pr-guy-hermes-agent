@@ -589,6 +589,58 @@ def test_update_entry_uses_latest_store_and_does_not_revive_removed_entry(tmp_pa
     assert entries[0]["access_token"] == "access-new"
 
 
+def test_mark_exhausted_does_not_restore_entry_removed_by_fresh_pool(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "access-1",
+                        "refresh_token": "refresh-1",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": "access-2",
+                        "refresh_token": "refresh-2",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    stale_pool = load_pool("openai-codex")
+    fresh_pool = load_pool("openai-codex")
+
+    removed = fresh_pool.remove_entry("cred-2")
+    assert removed is not None
+
+    selected = stale_pool.select()
+    assert selected is not None
+    assert selected.id == "cred-1"
+
+    next_entry = stale_pool.mark_exhausted_and_rotate(status_code=429)
+    assert next_entry is None
+
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entries = payload["credential_pool"]["openai-codex"]
+    assert [entry["id"] for entry in entries] == ["cred-1"]
+    assert entries[0]["last_status"] == "exhausted"
+
+
 def test_load_pool_seeds_env_api_key(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-seeded")
