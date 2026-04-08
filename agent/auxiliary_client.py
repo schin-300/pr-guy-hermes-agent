@@ -1451,20 +1451,24 @@ def _strict_vision_backend_available(provider: str) -> bool:
     return _resolve_strict_vision_backend(provider)[0] is not None
 
 
-def _preferred_main_vision_provider() -> Optional[str]:
-    """Return the selected main provider when it is also a supported vision backend."""
-    try:
-        from hermes_cli.config import load_config
+def _read_active_provider_for_vision() -> str:
+    """Return the user's active provider for vision auto fallback.
 
-        config = load_config()
-        model_cfg = config.get("model", {})
-        if isinstance(model_cfg, dict):
-            provider = _normalize_vision_provider(model_cfg.get("provider", ""))
-            if provider in _VISION_AUTO_PROVIDER_ORDER:
-                return provider
+    Prefer config.yaml's main provider, but fall back to auth.json active_provider
+    when no main provider is configured there.
+    """
+    main_provider = _read_main_provider()
+    if main_provider and main_provider not in ("auto", ""):
+        return main_provider
+    try:
+        from hermes_cli.auth import get_active_provider
+
+        active_provider = _normalize_vision_provider(get_active_provider())
+        if active_provider and active_provider not in ("auto", ""):
+            return active_provider
     except Exception:
         pass
-    return None
+    return ""
 
 
 def get_available_vision_backends() -> List[str]:
@@ -1476,8 +1480,9 @@ def get_available_vision_backends() -> List[str]:
     available = [p for p in _VISION_AUTO_PROVIDER_ORDER
                  if _strict_vision_backend_available(p)]
     # Also check the user's active provider (may be DeepSeek, Alibaba, named
-    # custom, etc.) — resolve_provider_client handles all provider types.
-    main_provider = _read_main_provider()
+    # custom, auth-store Codex, etc.) — resolve_provider_client handles all
+    # provider types.
+    main_provider = _read_active_provider_for_vision()
     if (main_provider and main_provider not in ("auto", "")
             and main_provider not in available):
         client, _ = resolve_provider_client(main_provider, _read_main_model())
@@ -1539,7 +1544,7 @@ def resolve_vision_provider_client(
                 return _finalize(candidate, sync_client, default_model)
 
         # Fall back to the user's active provider + model.
-        main_provider = _read_main_provider()
+        main_provider = _read_active_provider_for_vision()
         main_model = _read_main_model()
         if main_provider and main_provider not in ("auto", ""):
             sync_client, resolved_model = resolve_provider_client(
