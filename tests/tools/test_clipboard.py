@@ -752,7 +752,101 @@ class TestHasClipboardImage:
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# Level 2: _preprocess_images_with_vision — image → text via vision tool
+# Level 2: Text clipboard copy helpers
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestCopyTextToClipboard:
+    def test_macos_uses_pbcopy(self):
+        import hermes_cli.clipboard as cb
+
+        with patch("hermes_cli.clipboard.sys.platform", "darwin"):
+            with patch("hermes_cli.clipboard.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="")
+                ok, error = cb.copy_text_to_clipboard("hello world")
+
+        assert ok is True
+        assert error is None
+        mock_run.assert_called_once_with(
+            ["pbcopy"],
+            input="hello world",
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+
+    def test_linux_x11_uses_xclip_when_available(self):
+        import hermes_cli.clipboard as cb
+
+        with patch("hermes_cli.clipboard.sys.platform", "linux"):
+            with patch("hermes_cli.clipboard._is_wsl", return_value=False):
+                with patch.dict(os.environ, {}, clear=True):
+                    with patch("hermes_cli.clipboard.shutil.which", side_effect=lambda cmd: "/usr/bin/xclip" if cmd == "xclip" else None):
+                        with patch("hermes_cli.clipboard.subprocess.run") as mock_run:
+                            mock_run.return_value = MagicMock(returncode=0, stderr="")
+                            ok, error = cb.copy_text_to_clipboard("copied text")
+
+        assert ok is True
+        assert error is None
+        mock_run.assert_called_once_with(
+            ["xclip", "-selection", "clipboard"],
+            input="copied text",
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+
+    def test_linux_without_copy_backend_returns_helpful_error(self):
+        import hermes_cli.clipboard as cb
+
+        with patch("hermes_cli.clipboard.sys.platform", "linux"):
+            with patch("hermes_cli.clipboard._is_wsl", return_value=False):
+                with patch.dict(os.environ, {}, clear=True):
+                    with patch("hermes_cli.clipboard.shutil.which", return_value=None):
+                        ok, error = cb.copy_text_to_clipboard("hello")
+
+        assert ok is False
+        assert error is not None
+        assert "clipboard" in error.lower()
+        assert "wl-copy" in error or "xclip" in error
+
+
+class TestCopyLatestAssistantMessage:
+    @pytest.fixture
+    def cli(self):
+        from cli import HermesCLI
+        cli_obj = HermesCLI.__new__(HermesCLI)
+        cli_obj._last_assistant_message_text = ""
+        return cli_obj
+
+    def test_no_reply_returns_message(self, cli):
+        assert cli._copy_latest_assistant_message() == (False, "No assistant reply yet to copy.")
+
+    def test_success_copies_latest_reply(self, cli):
+        cli._last_assistant_message_text = "latest reply"
+
+        with patch("hermes_cli.clipboard.copy_text_to_clipboard", return_value=(True, None)) as mock_copy:
+            assert cli._copy_latest_assistant_message() == (
+                True,
+                "Copied latest assistant reply to the system clipboard.",
+            )
+
+        mock_copy.assert_called_once_with("latest reply")
+
+    def test_backend_error_is_returned(self, cli):
+        cli._last_assistant_message_text = "latest reply"
+
+        with patch("hermes_cli.clipboard.copy_text_to_clipboard", return_value=(False, "xclip missing")):
+            assert cli._copy_latest_assistant_message() == (
+                False,
+                "Clipboard copy failed: xclip missing",
+            )
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Level 3: _preprocess_images_with_vision — image → text via vision tool
 # ═════════════════════════════════════════════════════════════════════════
 
 class TestPreprocessImagesWithVision:
@@ -862,6 +956,55 @@ class TestPreprocessImagesWithVision:
             result = cli._preprocess_images_with_vision("check this", [img])
         assert isinstance(result, str)
         assert str(img) in result  # path still included for retry
+
+
+class TestPrepareUserMessageWithImages:
+    @pytest.fixture
+    def cli(self):
+        from cli import HermesCLI
+        cli_obj = HermesCLI.__new__(HermesCLI)
+        return cli_obj
+
+    def test_codex_route_uses_native_multimodal(self, cli, tmp_path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        result = cli._prepare_user_message_with_images(
+            "Describe this",
+            [img],
+            {
+                "runtime": {
+                    "provider": "openai-codex",
+                    "api_mode": "codex_responses",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                }
+            },
+        )
+
+        assert isinstance(result, list)
+        assert result[0]["type"] == "text"
+        assert result[1]["type"] == "image_url"
+        assert result[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+    def test_text_only_route_uses_vision_fallback(self, cli, tmp_path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        with patch.object(cli, "_preprocess_images_with_vision", return_value="fallback text") as mock_pre:
+            result = cli._prepare_user_message_with_images(
+                "Describe this",
+                [img],
+                {
+                    "runtime": {
+                        "provider": "openrouter",
+                        "api_mode": "chat_completions",
+                        "base_url": "https://openrouter.ai/api/v1",
+                    }
+                },
+            )
+
+        assert result == "fallback text"
+        mock_pre.assert_called_once_with("Describe this", [img])
 
 
 # ═════════════════════════════════════════════════════════════════════════

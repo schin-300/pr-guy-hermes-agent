@@ -1,20 +1,24 @@
-"""Clipboard image extraction for macOS, Windows, Linux, and WSL2.
+"""Clipboard image extraction and text copy helpers for macOS, Windows, Linux, and WSL2.
 
-Provides a single function `save_clipboard_image(dest)` that checks the
-system clipboard for image data, saves it to *dest* as PNG, and returns
-True on success.  No external Python dependencies — uses only OS-level
-CLI tools that ship with the platform (or are commonly installed).
+Provides:
+- `save_clipboard_image(dest)` to extract clipboard image data to *dest*
+- `has_clipboard_image()` to cheaply detect clipboard image content
+- `copy_text_to_clipboard(text)` to copy plain text to the system clipboard
+
+No external Python dependencies — uses only OS-level CLI tools that ship
+with the platform (or are commonly installed).
 
 Platform support:
-  macOS   — osascript (always available), pngpaste (if installed)
+  macOS   — osascript/pngpaste for images, pbcopy for text
   Windows — PowerShell via .NET System.Windows.Forms.Clipboard
-  WSL2    — powershell.exe via .NET System.Windows.Forms.Clipboard
-  Linux   — wl-paste (Wayland), xclip (X11)
+  WSL2    — powershell.exe/.NET for images, clip.exe for text
+  Linux   — wl-paste/wl-copy (Wayland), xclip (X11)
 """
 
 import base64
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -52,6 +56,77 @@ def has_clipboard_image() -> bool:
     if os.environ.get("WAYLAND_DISPLAY"):
         return _wayland_has_image()
     return _xclip_has_image()
+
+
+def copy_text_to_clipboard(text: str) -> tuple[bool, str | None]:
+    """Copy plain text to the system clipboard.
+
+    Returns (True, None) on success, or (False, error_message) on failure.
+    """
+    command, missing_error = _text_copy_command()
+    if not command:
+        return False, missing_error
+
+    run_kwargs = {
+        "input": text,
+        "text": True,
+        "timeout": 3,
+        "check": False,
+    }
+    if command[0] in {"wl-copy", "xclip", "xsel"}:
+        # These Linux clipboard tools may keep a background process alive to
+        # serve clipboard requests. Capturing pipes can make subprocess.run()
+        # wait on that background child until timeout.
+        run_kwargs["stdout"] = subprocess.DEVNULL
+        run_kwargs["stderr"] = subprocess.DEVNULL
+    else:
+        run_kwargs["capture_output"] = True
+
+    try:
+        result = subprocess.run(command, **run_kwargs)
+    except FileNotFoundError:
+        return False, f"Clipboard copy backend not installed: {command[0]}"
+    except Exception as e:
+        logger.debug("Clipboard text copy failed: %s", e)
+        return False, str(e)
+
+    if result.returncode == 0:
+        return True, None
+
+    detail = (result.stderr or result.stdout or "").strip()
+    if not detail:
+        detail = f"{command[0]} exited with status {result.returncode}"
+    return False, detail
+
+
+def _text_copy_command() -> tuple[list[str] | None, str | None]:
+    """Return a text clipboard command and a fallback error if unavailable."""
+    if sys.platform == "darwin":
+        return ["pbcopy"], None
+
+    if _is_wsl():
+        if shutil.which("clip.exe"):
+            return ["clip.exe"], None
+        if shutil.which("powershell.exe"):
+            return [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Set-Clipboard",
+            ], None
+        return None, "No clipboard copy backend found in WSL. Install/use clip.exe or powershell.exe."
+
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+        return ["wl-copy"], None
+
+    if shutil.which("xclip"):
+        return ["xclip", "-selection", "clipboard"], None
+
+    if shutil.which("xsel"):
+        return ["xsel", "--clipboard", "--input"], None
+
+    return None, "No clipboard copy backend found. Install wl-copy (Wayland) or xclip/xsel (X11)."
 
 
 # ── macOS ────────────────────────────────────────────────────────────────
