@@ -2160,6 +2160,9 @@ class GatewayRunner:
         if canonical == "branch":
             return await self._handle_branch_command(event)
 
+        if canonical == "spawn":
+            return await self._handle_spawn_command(event)
+
         if canonical == "rollback":
             return await self._handle_rollback_command(event)
 
@@ -4552,6 +4555,60 @@ class GatewayRunner:
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return f'🔄 Background task started: "{preview}"\nTask ID: {task_id}\nYou can keep chatting — results will appear when done.'
 
+    async def _handle_spawn_command(self, event: MessageEvent) -> str:
+        """Handle /spawn <prompt> — clone the current session and run a child task."""
+        prompt = event.get_command_args().strip()
+        if not prompt:
+            return (
+                "Usage: /spawn <prompt>\n"
+                "Example: /spawn Continue this research in the background\n\n"
+                "Clones the current session, keeps you here, and runs the prompt in the child session."
+            )
+
+        if not self._session_db:
+            return "Session database not available."
+
+        source = event.source
+        current_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(current_entry.session_id)
+        if not history:
+            return "No conversation to spawn from — send a message first."
+
+        now = datetime.now()
+        task_id = f"spawn_{now.strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        new_session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{os.urandom(3).hex()}"
+        current_title = self._session_db.get_session_title(current_entry.session_id)
+        child_title = self._session_db.get_next_title_in_lineage(current_title or "spawn")
+
+        try:
+            self._session_db.clone_session(
+                source_session_id=current_entry.session_id,
+                new_session_id=new_session_id,
+                source=source.platform.value if source.platform else "gateway",
+                model=None,
+                parent_session_id=current_entry.session_id,
+                title=child_title,
+                messages=history,
+            )
+        except Exception as e:
+            logger.error("Failed to create spawn session: %s", e)
+            return f"Failed to create spawn session: {e}"
+
+        _task = asyncio.create_task(
+            self._run_spawn_task(prompt, source, task_id, new_session_id, history)
+        )
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
+
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        return (
+            f'🪄 Spawn task started: "{preview}"\n'
+            f"Task ID: {task_id}\n"
+            f"Parent session: {current_entry.session_id}\n"
+            f"Child session: {new_session_id}\n"
+            "You stay on the current session — results will appear here when done."
+        )
+
     async def _run_background_task(
         self, prompt: str, source: "SessionSource", task_id: str
     ) -> None:
@@ -4677,6 +4734,142 @@ class GatewayRunner:
                 await adapter.send(
                     chat_id=source.chat_id,
                     content=f"❌ Background task {task_id} failed: {e}",
+                    metadata=_thread_metadata,
+                )
+            except Exception:
+                pass
+
+    async def _run_spawn_task(
+        self,
+        prompt: str,
+        source: "SessionSource",
+        task_id: str,
+        child_session_id: str,
+        history_snapshot: list[dict],
+    ) -> None:
+        """Execute a cloned-session background task and deliver the result."""
+        from run_agent import AIAgent
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.warning("No adapter for platform %s in spawn task %s", source.platform, task_id)
+            return
+
+        _thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            if not runtime_kwargs.get("api_key"):
+                await adapter.send(
+                    source.chat_id,
+                    f"❌ Spawn task {task_id} failed: no provider credentials configured.",
+                    metadata=_thread_metadata,
+                )
+                return
+
+            user_config = _load_gateway_config()
+            model = _resolve_gateway_model(user_config)
+            platform_key = _platform_config_key(source.platform)
+
+            from hermes_cli.tools_config import _get_platform_tools
+            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+
+            pr = self._provider_routing
+            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            reasoning_config = self._load_reasoning_config()
+            self._reasoning_config = reasoning_config
+            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+
+            def run_sync():
+                agent = AIAgent(
+                    model=turn_route["model"],
+                    **turn_route["runtime"],
+                    max_iterations=max_iterations,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    enabled_toolsets=enabled_toolsets,
+                    reasoning_config=reasoning_config,
+                    providers_allowed=pr.get("only"),
+                    providers_ignored=pr.get("ignore"),
+                    providers_order=pr.get("order"),
+                    provider_sort=pr.get("sort"),
+                    provider_require_parameters=pr.get("require_parameters", False),
+                    provider_data_collection=pr.get("data_collection"),
+                    session_id=child_session_id,
+                    platform=platform_key,
+                    session_db=self._session_db,
+                    fallback_model=self._fallback_model,
+                    pass_session_id=False,
+                )
+
+                return agent.run_conversation(
+                    user_message=prompt,
+                    conversation_history=history_snapshot,
+                    task_id=task_id,
+                )
+
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, run_sync)
+
+            response = result.get("final_response", "") if result else ""
+            if not response and result and result.get("error"):
+                response = f"Error: {result['error']}"
+
+            preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+            header = (
+                f'✅ Spawn task complete\n'
+                f'Prompt: "{preview}"\n'
+                f'Child session: {child_session_id}\n\n'
+            )
+
+            if response:
+                media_files, response = adapter.extract_media(response)
+                images, text_content = adapter.extract_images(response)
+
+                if text_content:
+                    await adapter.send(
+                        chat_id=source.chat_id,
+                        content=header + text_content,
+                        metadata=_thread_metadata,
+                    )
+                elif not images and not media_files:
+                    await adapter.send(
+                        chat_id=source.chat_id,
+                        content=header + "(No response generated)",
+                        metadata=_thread_metadata,
+                    )
+
+                for image_url, alt_text in (images or []):
+                    try:
+                        await adapter.send_image(
+                            chat_id=source.chat_id,
+                            image_url=image_url,
+                            caption=alt_text,
+                        )
+                    except Exception:
+                        pass
+
+                for media_path in (media_files or []):
+                    try:
+                        await adapter.send_document(
+                            chat_id=source.chat_id,
+                            file_path=media_path,
+                        )
+                    except Exception:
+                        pass
+            else:
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=header + "(No response generated)",
+                    metadata=_thread_metadata,
+                )
+
+        except Exception as e:
+            logger.exception("Spawn task %s failed", task_id)
+            try:
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=f"❌ Spawn task {task_id} failed: {e}",
                     metadata=_thread_metadata,
                 )
             except Exception:
@@ -5276,38 +5469,20 @@ class GatewayRunner:
 
         parent_session_id = current_entry.session_id
 
-        # Create the new session with parent link
+        # Create the new session with parent link and copied transcript
         try:
-            self._session_db.create_session(
-                session_id=new_session_id,
+            self._session_db.clone_session(
+                source_session_id=parent_session_id,
+                new_session_id=new_session_id,
                 source=source.platform.value if source.platform else "gateway",
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
                 parent_session_id=parent_session_id,
+                title=branch_title,
+                messages=history,
             )
         except Exception as e:
             logger.error("Failed to create branch session: %s", e)
             return f"Failed to create branch: {e}"
-
-        # Copy conversation history to the new session
-        for msg in history:
-            try:
-                self._session_db.append_message(
-                    session_id=new_session_id,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    tool_name=msg.get("tool_name") or msg.get("name"),
-                    tool_calls=msg.get("tool_calls"),
-                    tool_call_id=msg.get("tool_call_id"),
-                    reasoning=msg.get("reasoning"),
-                )
-            except Exception:
-                pass  # Best-effort copy
-
-        # Set title
-        try:
-            self._session_db.set_session_title(new_session_id, branch_title)
-        except Exception:
-            pass
 
         # Switch the session store entry to the new session
         new_entry = self.session_store.switch_session(session_key, new_session_id)

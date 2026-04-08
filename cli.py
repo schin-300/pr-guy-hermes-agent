@@ -5195,10 +5195,11 @@ class HermesCLI:
         except Exception:
             pass
 
-        # Create the new session with parent link
+        # Create the new session with parent link and copied transcript
         try:
-            self._session_db.create_session(
-                session_id=new_session_id,
+            self._session_db.clone_session(
+                source_session_id=parent_session_id,
+                new_session_id=new_session_id,
                 source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                 model=self.model,
                 model_config={
@@ -5206,10 +5207,15 @@ class HermesCLI:
                     "reasoning_config": self.reasoning_config,
                 },
                 parent_session_id=parent_session_id,
+                title=branch_title,
+                messages=self.conversation_history,
             )
         except Exception as e:
             _cprint(f"  Failed to create branch session: {e}")
             return
+
+        _cprint(f"  Original session: {parent_session_id}")
+        _cprint(f"  Branch session:   {new_session_id}")
 
         # Copy conversation history to the new session
         for msg in branch_history:

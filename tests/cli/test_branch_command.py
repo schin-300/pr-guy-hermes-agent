@@ -176,8 +176,98 @@ class TestBranchCommandCLI:
         assert result.name == "branch"
 
 
+def _find_child_sessions(session_db, parent_session_id):
+    cursor = session_db._conn.execute(
+        "SELECT id FROM sessions WHERE parent_session_id = ? ORDER BY started_at",
+        (parent_session_id,),
+    )
+    return [row["id"] for row in cursor.fetchall()]
+
+
+class _ImmediateThread:
+    def __init__(self, target=None, daemon=None, name=None, args=(), kwargs=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+        self.daemon = daemon
+        self.name = name
+
+    def start(self):
+        if self._target:
+            self._target(*self._args, **self._kwargs)
+
+
+class TestSpawnCommandCLI:
+    """Test the /spawn command logic for the CLI."""
+
+    def _configure_spawn_cli(self, cli_instance):
+        cli_instance._background_task_counter = 0
+        cli_instance._background_tasks = {}
+        cli_instance.enabled_toolsets = ["terminal", "file"]
+        cli_instance._providers_only = None
+        cli_instance._providers_ignore = None
+        cli_instance._providers_order = None
+        cli_instance._provider_sort = None
+        cli_instance._provider_require_params = False
+        cli_instance._provider_data_collection = None
+        cli_instance._fallback_model = None
+        cli_instance._agent_running = False
+        cli_instance._spinner_text = ""
+        cli_instance._app = None
+        cli_instance.bell_on_complete = False
+        cli_instance._ensure_runtime_credentials = MagicMock(return_value=True)
+        cli_instance._resolve_turn_agent_config = MagicMock(
+            return_value={"model": cli_instance.model, "runtime": {}}
+        )
+
+    def test_spawn_creates_child_session_without_switching(self, cli_instance, session_db):
+        from cli import HermesCLI
+
+        self._configure_spawn_cli(cli_instance)
+        original_id = cli_instance.session_id
+
+        with patch("cli.threading.Thread", _ImmediateThread), \
+             patch("cli.AIAgent") as MockAgent, \
+             patch("cli.ChatConsole") as MockChatConsole:
+            MockAgent.return_value.run_conversation.return_value = {"final_response": ""}
+            MockChatConsole.return_value.print = MagicMock()
+            HermesCLI._handle_spawn_command(cli_instance, "/spawn Continue in the background")
+
+        child_sessions = _find_child_sessions(session_db, original_id)
+        assert len(child_sessions) == 1
+        child_id = child_sessions[0]
+        assert cli_instance.session_id == original_id
+        assert child_id != original_id
+        assert session_db.get_session(original_id)["end_reason"] is None
+        assert session_db.get_session(child_id)["parent_session_id"] == original_id
+        assert len(session_db.get_messages_as_conversation(child_id)) == 4
+
+    def test_spawn_runs_child_with_pass_session_id_disabled(self, cli_instance, session_db):
+        from cli import HermesCLI
+
+        self._configure_spawn_cli(cli_instance)
+        original_id = cli_instance.session_id
+
+        with patch("cli.threading.Thread", _ImmediateThread), \
+             patch("cli.AIAgent") as MockAgent, \
+             patch("cli.ChatConsole") as MockChatConsole:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": ""}
+            MockAgent.return_value = mock_agent
+            MockChatConsole.return_value.print = MagicMock()
+
+            HermesCLI._handle_spawn_command(cli_instance, "/spawn Continue in the background")
+
+        child_id = _find_child_sessions(session_db, original_id)[0]
+        kwargs = MockAgent.call_args.kwargs
+        assert kwargs["session_id"] == child_id
+        assert kwargs["pass_session_id"] is False
+        mock_agent.run_conversation.assert_called_once()
+        assert mock_agent.run_conversation.call_args.kwargs["conversation_history"] == cli_instance.conversation_history
+
+
 class TestBranchCommandDef:
-    """Test the CommandDef registration for /branch."""
+    """Test the CommandDef registration for /branch and /spawn."""
 
     def test_branch_in_registry(self):
         """The branch command should be in the command registry."""
@@ -196,3 +286,13 @@ class TestBranchCommandDef:
         from hermes_cli.commands import COMMAND_REGISTRY
         branch = next(c for c in COMMAND_REGISTRY if c.name == "branch")
         assert branch.category == "Session"
+
+    def test_spawn_in_registry(self):
+        from hermes_cli.commands import COMMAND_REGISTRY
+        names = [c.name for c in COMMAND_REGISTRY]
+        assert "spawn" in names
+
+    def test_spawn_in_session_category(self):
+        from hermes_cli.commands import COMMAND_REGISTRY
+        spawn = next(c for c in COMMAND_REGISTRY if c.name == "spawn")
+        assert spawn.category == "Session"
