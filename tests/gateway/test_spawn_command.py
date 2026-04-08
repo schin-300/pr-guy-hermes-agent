@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource, build_session_key
 
 
@@ -235,7 +235,8 @@ class TestRunSpawnTask:
     async def test_spawn_task_uses_child_session_and_disables_pass_session_id(self, session_db):
         runner, _, history = _make_runner(session_db)
         mock_adapter = AsyncMock()
-        mock_adapter.send = AsyncMock()
+        mock_adapter.send = AsyncMock(return_value=SendResult(success=True))
+        mock_adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True))
         mock_adapter.extract_media = MagicMock(return_value=([], "Spawned result"))
         mock_adapter.extract_images = MagicMock(return_value=([], "Spawned result"))
         runner.adapters[Platform.TELEGRAM] = mock_adapter
@@ -269,7 +270,7 @@ class TestRunSpawnTask:
             conversation_history=history,
             task_id="spawn_test",
         )
-        sent_content = mock_adapter.send.call_args.kwargs["content"]
+        sent_content = mock_adapter._send_with_retry.call_args.kwargs["content"]
         assert "Spawn task complete" in sent_content
         assert "20260408_090001_child" in sent_content
 
@@ -278,7 +279,8 @@ class TestRunSpawnTask:
         runner, parent_id, history = _make_runner(session_db)
         runner.session_store.append_to_transcript = MagicMock()
         mock_adapter = AsyncMock()
-        mock_adapter.send = AsyncMock()
+        mock_adapter.send = AsyncMock(return_value=SendResult(success=True))
+        mock_adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True))
         mock_adapter.extract_media = MagicMock(return_value=([], "Spawned result"))
         mock_adapter.extract_images = MagicMock(return_value=([], "Spawned result"))
         runner.adapters[Platform.TELEGRAM] = mock_adapter
@@ -310,6 +312,45 @@ class TestRunSpawnTask:
         assert args[0] == parent_id
         assert "Spawn task complete" in args[1]["content"]
         assert "Spawned result" in args[1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_sends_text_callback_even_when_response_is_media_only(self, session_db):
+        runner, parent_id, history = _make_runner(session_db)
+        runner.session_store.append_to_transcript = MagicMock()
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock(return_value=SendResult(success=True))
+        mock_adapter._send_with_retry = AsyncMock(return_value=SendResult(success=True))
+        mock_adapter.send_document = AsyncMock(return_value=SendResult(success=True))
+        mock_adapter.extract_media = MagicMock(return_value=([("/tmp/result.txt", False)], ""))
+        mock_adapter.extract_images = MagicMock(return_value=([], ""))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "MEDIA:/tmp/result.txt", "messages": []}
+            MockAgent.return_value = mock_agent
+
+            await runner._run_spawn_task(
+                prompt="continue",
+                source=source,
+                task_id="spawn_test",
+                child_session_id="20260408_090001_child",
+                history_snapshot=history,
+                parent_session_id=parent_id,
+            )
+
+        sent_content = mock_adapter._send_with_retry.call_args.kwargs["content"]
+        assert "Spawn task complete" in sent_content
+        assert "(See attached media)" in sent_content
+        mock_adapter.send_document.assert_awaited_once()
 
 
 class TestSpawnCommandRegistration:

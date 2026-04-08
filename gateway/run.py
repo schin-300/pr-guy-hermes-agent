@@ -4636,6 +4636,46 @@ class GatewayRunner:
                 exc,
             )
 
+    async def _deliver_spawn_result(
+        self,
+        adapter,
+        source: "SessionSource",
+        content: str,
+        *,
+        metadata: dict | None = None,
+        parent_session_id: str | None = None,
+    ):
+        """Persist a /spawn result to the parent transcript and deliver it with retry."""
+        self._persist_spawn_result_to_parent(parent_session_id, content)
+
+        send_with_retry = getattr(adapter, "_send_with_retry", None)
+        if callable(send_with_retry):
+            result = await send_with_retry(
+                chat_id=source.chat_id,
+                content=content,
+                metadata=metadata,
+            )
+        else:
+            result = await adapter.send(
+                chat_id=source.chat_id,
+                content=content,
+                metadata=metadata,
+            )
+
+        if not getattr(result, "success", True):
+            error_detail = getattr(result, "error", None) or "unknown send failure"
+            logger.error(
+                "Failed to deliver /spawn result for task chat=%s parent=%s: %s",
+                source.chat_id,
+                parent_session_id,
+                error_detail,
+            )
+            self._persist_spawn_result_to_parent(
+                parent_session_id,
+                f"⚠️ Spawn result delivery to chat failed after retry: {error_detail}",
+            )
+        return result
+
     async def _run_background_task(
         self, prompt: str, source: "SessionSource", task_id: str
     ) -> None:
@@ -4789,11 +4829,12 @@ class GatewayRunner:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
             if not runtime_kwargs.get("api_key"):
                 error_content = f"❌ Spawn task {task_id} failed: no provider credentials configured."
-                self._persist_spawn_result_to_parent(parent_session_id, error_content)
-                await adapter.send(
-                    source.chat_id,
+                await self._deliver_spawn_result(
+                    adapter,
+                    source,
                     error_content,
                     metadata=_thread_metadata,
+                    parent_session_id=parent_session_id,
                 )
                 return
 
@@ -4855,21 +4896,14 @@ class GatewayRunner:
             if response:
                 media_files, response = adapter.extract_media(response)
                 images, text_content = adapter.extract_images(response)
-                persisted_text = header + (text_content or "(See attached media)")
-                self._persist_spawn_result_to_parent(parent_session_id, persisted_text)
-
-                if text_content:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + text_content,
-                        metadata=_thread_metadata,
-                    )
-                elif not images and not media_files:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + "(No response generated)",
-                        metadata=_thread_metadata,
-                    )
+                delivery_text = header + (text_content or "(See attached media)")
+                await self._deliver_spawn_result(
+                    adapter,
+                    source,
+                    delivery_text,
+                    metadata=_thread_metadata,
+                    parent_session_id=parent_session_id,
+                )
 
                 for image_url, alt_text in (images or []):
                     try:
@@ -4890,25 +4924,24 @@ class GatewayRunner:
                     except Exception:
                         pass
             else:
-                self._persist_spawn_result_to_parent(
-                    parent_session_id,
+                await self._deliver_spawn_result(
+                    adapter,
+                    source,
                     header + "(No response generated)",
-                )
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=header + "(No response generated)",
                     metadata=_thread_metadata,
+                    parent_session_id=parent_session_id,
                 )
 
         except Exception as e:
             logger.exception("Spawn task %s failed", task_id)
             try:
                 error_content = f"❌ Spawn task {task_id} failed: {e}"
-                self._persist_spawn_result_to_parent(parent_session_id, error_content)
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=error_content,
+                await self._deliver_spawn_result(
+                    adapter,
+                    source,
+                    error_content,
                     metadata=_thread_metadata,
+                    parent_session_id=parent_session_id,
                 )
             except Exception:
                 pass
