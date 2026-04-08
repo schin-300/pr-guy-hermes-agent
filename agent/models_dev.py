@@ -146,6 +146,10 @@ class ProviderInfo:
 # Hermes provider names → models.dev provider IDs
 PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "openrouter": "openrouter",
+    "openai": "openai",
+    # Codex OAuth hits chatgpt.com/backend-api/codex, but the model metadata and
+    # context limits should follow OpenAI's catalog rather than GitHub Copilot.
+    "openai-codex": "openai",
     "anthropic": "anthropic",
     "zai": "zai",
     "kimi-coding": "kimi-for-coding",

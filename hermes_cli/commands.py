@@ -138,6 +138,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
                cli_only=True, aliases=("gateway",)),
+    CommandDef("copy", "Copy the latest reply or a numbered visible reply", "Info",
+               cli_only=True, args_hint="[message-number]"),
     CommandDef("paste", "Check clipboard for an image and attach it", "Info",
                cli_only=True),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info",

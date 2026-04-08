@@ -184,21 +184,25 @@ class HermesACPAgent(acp.Agent):
             return
 
         try:
-            from model_tools import get_tool_definitions
+            refresh_method = getattr(type(state.agent), "refresh_tool_surface", None)
+            if callable(refresh_method):
+                state.agent.refresh_tool_surface(quiet_mode=True, invalidate_prompt=True)
+            else:
+                from model_tools import get_tool_definitions
 
-            enabled_toolsets = getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
-            disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
-            state.agent.tools = get_tool_definitions(
-                enabled_toolsets=enabled_toolsets,
-                disabled_toolsets=disabled_toolsets,
-                quiet_mode=True,
-            )
-            state.agent.valid_tool_names = {
-                tool["function"]["name"] for tool in state.agent.tools or []
-            }
-            invalidate = getattr(state.agent, "_invalidate_system_prompt", None)
-            if callable(invalidate):
-                invalidate()
+                enabled_toolsets = getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+                disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
+                state.agent.tools = get_tool_definitions(
+                    enabled_toolsets=enabled_toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                    quiet_mode=True,
+                )
+                state.agent.valid_tool_names = {
+                    tool["function"]["name"] for tool in state.agent.tools or []
+                }
+                invalidate = getattr(state.agent, "_invalidate_system_prompt", None)
+                if callable(invalidate):
+                    invalidate()
             logger.info(
                 "Session %s: refreshed tool surface after ACP MCP registration (%d tools)",
                 state.session_id,
@@ -583,9 +587,13 @@ class HermesACPAgent(acp.Agent):
 
     def _cmd_tools(self, args: str, state: SessionState) -> str:
         try:
-            from model_tools import get_tool_definitions
-            toolsets = getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
-            tools = get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
+            refresh_method = getattr(type(state.agent), "refresh_tool_surface", None)
+            if callable(refresh_method):
+                tools = state.agent.refresh_tool_surface(quiet_mode=True, invalidate_prompt=False)
+            else:
+                from model_tools import get_tool_definitions
+                toolsets = getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+                tools = get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
             if not tools:
                 return "No tools available."
             lines = [f"Available tools ({len(tools)}):"]

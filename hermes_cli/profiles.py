@@ -101,7 +101,7 @@ _RESERVED_NAMES = frozenset({
 
 # Hermes subcommands that cannot be used as profile names/aliases
 _HERMES_SUBCOMMANDS = frozenset({
-    "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
+    "chat", "model", "gateway", "overlay", "setup", "whatsapp", "login", "logout",
     "status", "cron", "doctor", "config", "pairing", "skills", "tools",
     "mcp", "sessions", "insights", "version", "update", "uninstall",
     "profile", "plugins", "honcho", "acp",
@@ -1007,7 +1007,7 @@ _hermes_completion() {
 
     # Top-level subcommands
     if [[ "$COMP_CWORD" == 1 ]]; then
-        local commands="chat model gateway setup status cron doctor config skills tools mcp sessions profile update version"
+        local commands="chat model gateway overlay setup status cron doctor config skills tools mcp sessions profile update version"
         COMPREPLY=($(compgen -W "$commands" -- "$cur"))
     fi
 }

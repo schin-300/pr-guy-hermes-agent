@@ -819,6 +819,8 @@ class TestCopyLatestAssistantMessage:
         from cli import HermesCLI
         cli_obj = HermesCLI.__new__(HermesCLI)
         cli_obj._last_assistant_message_text = ""
+        cli_obj._assistant_copy_entries = []
+        cli_obj._next_assistant_copy_id = 0
         return cli_obj
 
     def test_no_reply_returns_message(self, cli):
@@ -843,6 +845,79 @@ class TestCopyLatestAssistantMessage:
                 False,
                 "Clipboard copy failed: xclip missing",
             )
+
+
+class TestPerMessageCopyButtons:
+    @pytest.fixture
+    def cli(self):
+        from cli import HermesCLI
+        cli_obj = HermesCLI.__new__(HermesCLI)
+        cli_obj._last_assistant_message_text = ""
+        cli_obj._assistant_copy_entries = []
+        cli_obj._next_assistant_copy_id = 0
+        return cli_obj
+
+    def test_remember_assistant_message_assigns_copy_number(self, cli):
+        first_id = cli._remember_assistant_message("first reply")
+        second_id = cli._remember_assistant_message("second reply")
+
+        assert first_id == 1
+        assert second_id == 2
+        assert cli._last_assistant_message_text == "second reply"
+        assert cli._assistant_copy_entries == [
+            (1, "first reply"),
+            (2, "second reply"),
+        ]
+
+    def test_copy_hint_without_specific_reply_matches_original(self, cli):
+        assert cli._assistant_copy_hint_text() == "  ⧉ Alt+C copy latest reply"
+
+    def test_copy_hint_targets_specific_copy_command(self, cli):
+        reply_id = cli._remember_assistant_message("copy me")
+
+        assert cli._assistant_copy_hint_text(reply_id) == "  ⧉ Alt+C copy latest reply, /copy 1 for this reply"
+
+    def test_copy_specific_reply_uses_requested_message(self, cli):
+        cli._remember_assistant_message("first reply")
+        cli._remember_assistant_message("second reply")
+
+        with patch("hermes_cli.clipboard.copy_text_to_clipboard", return_value=(True, None)) as mock_copy:
+            assert cli._copy_assistant_message_by_id(1) == (
+                True,
+                "Copied reply #1 to the system clipboard.",
+            )
+
+        mock_copy.assert_called_once_with("first reply")
+
+    def test_copy_specific_reply_reports_missing_id(self, cli):
+        cli._remember_assistant_message("only reply")
+
+        assert cli._copy_assistant_message_by_id(7) == (
+            False,
+            "No assistant reply #7 is available to copy.",
+        )
+
+    def test_handle_copy_command_routes_specific_reply(self, cli):
+        with patch.object(cli, "_copy_assistant_message_by_id", return_value=(True, "ok")) as mock_copy, \
+             patch("cli._cprint") as mock_cprint:
+            cli._handle_copy_command("/copy 2")
+
+        mock_copy.assert_called_once_with(2)
+        assert any("ok" in call.args[0] for call in mock_cprint.call_args_list)
+
+    def test_process_command_routes_copy(self, cli):
+        cli._handle_copy_command = MagicMock()
+
+        result = cli.process_command("/copy 3")
+
+        assert result is True
+        cli._handle_copy_command.assert_called_once_with("/copy 3")
+
+    def test_copy_command_is_registered(self):
+        from hermes_cli.commands import COMMAND_REGISTRY, resolve_command
+
+        assert resolve_command("copy").name == "copy"
+        assert any(cmd.name == "copy" for cmd in COMMAND_REGISTRY)
 
 
 # ═════════════════════════════════════════════════════════════════════════

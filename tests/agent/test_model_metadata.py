@@ -194,6 +194,16 @@ class TestGetModelContextLength:
             result = get_model_context_length("custom/model")
             assert result == CONTEXT_PROBE_TIERS[0]
 
+    @patch("agent.models_dev.lookup_models_dev_context", return_value=1_050_000)
+    @patch("agent.model_metadata.fetch_model_metadata", return_value={})
+    def test_openai_codex_uses_openai_models_dev_context(self, _mock_fetch_meta, _mock_models_dev):
+        result = get_model_context_length(
+            "gpt-5.4",
+            base_url="https://chatgpt.com/backend-api/codex",
+            provider="openai-codex",
+        )
+        assert result == 1_050_000
+
     @patch("agent.model_metadata.fetch_model_metadata")
     @patch("agent.model_metadata.fetch_endpoint_model_metadata")
     def test_custom_endpoint_metadata_beats_fuzzy_default(self, mock_endpoint_fetch, mock_fetch):

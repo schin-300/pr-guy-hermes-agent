@@ -15,7 +15,9 @@ Usage:
 
 import logging
 import os
+import shlex
 import shutil
+import subprocess
 import sys
 import json
 import atexit
@@ -1559,7 +1561,7 @@ class HermesCLI:
         self._command_status = ""
         self._attached_images: list[Path] = []
         self._image_counter = 0
-        self._last_assistant_message_text: str = ""
+        self._reset_assistant_copy_state()
         self.preloaded_skills: list[str] = []
         self._startup_skills_line_shown = False
 
@@ -1576,6 +1578,17 @@ class HermesCLI:
 
         # Status bar visibility (toggled via /statusbar)
         self._status_bar_visible = True
+
+        # Native agent browser state (Ctrl+B)
+        self._agent_browser_open = False
+        self._agent_browser_selected_index = 0
+        self._agent_browser_cards = []
+        self._agent_browser_last_refresh = 0.0
+        self._agent_browser_last_presence_write = 0.0
+        self._agent_browser_generation_lock = threading.Lock()
+        self._agent_browser_generation_jobs: set[str] = set()
+        self._agent_browser_launch_target: str | None = None
+        self._agent_browser_columns = 3
 
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
@@ -2818,36 +2831,78 @@ class HermesCLI:
     def _assistant_copy_shortcut_label() -> str:
         return "Alt+C"
 
+    def _reset_assistant_copy_state(self) -> None:
+        self._last_assistant_message_text = ""
+        self._assistant_copy_entries: list[tuple[int, str]] = []
+        self._next_assistant_copy_id = 0
+
+    def _ensure_assistant_copy_state(self) -> None:
+        if not hasattr(self, "_last_assistant_message_text") or self._last_assistant_message_text is None:
+            self._last_assistant_message_text = ""
+        if not hasattr(self, "_assistant_copy_entries") or self._assistant_copy_entries is None:
+            self._assistant_copy_entries = []
+        if not hasattr(self, "_next_assistant_copy_id") or self._next_assistant_copy_id is None:
+            self._next_assistant_copy_id = 0
+
     @classmethod
-    def _assistant_copy_hint_text(cls) -> str:
-        return f"  ⧉ {cls._assistant_copy_shortcut_label()} copy latest reply"
+    def _assistant_copy_hint_text(cls, message_id: int | None = None) -> str:
+        base = f"  ⧉ {cls._assistant_copy_shortcut_label()} copy latest reply"
+        if message_id is None:
+            return base
+        return f"{base}, /copy {message_id} for this reply"
 
-    def _remember_assistant_message(self, text: Optional[str]) -> None:
-        """Store and publish the latest assistant-visible message."""
+    @classmethod
+    def _assistant_copy_hint_renderable(cls, message_id: int | None = None) -> _RichText:
+        return _RichText(cls._assistant_copy_hint_text(message_id), style="dim")
+
+    def _remember_assistant_message(self, text: Optional[str]) -> int | None:
+        """Store the latest assistant-visible message and return its copy ID."""
+        self._ensure_assistant_copy_state()
         plain = _rich_text_from_ansi(text or "").plain
-        if plain.strip():
-            self._last_assistant_message_text = plain
-            self._publish_latest_reply_to_overlay(plain)
+        if not plain.strip():
+            return None
+        self._last_assistant_message_text = plain
+        self._next_assistant_copy_id += 1
+        message_id = self._next_assistant_copy_id
+        self._assistant_copy_entries.append((message_id, plain))
+        return message_id
 
-    def _show_assistant_copy_hint(self) -> None:
+    def _show_assistant_copy_hint(self, message_id: int | None = None) -> None:
         if not getattr(self, "_app", None):
             return
-        ChatConsole().print(f"[dim]{_escape(self._assistant_copy_hint_text())}[/]")
+        ChatConsole().print(self._assistant_copy_hint_renderable(message_id))
 
-    def _copy_latest_assistant_message(self) -> tuple[bool, str]:
-        """Copy the latest assistant reply shown in the interactive chat."""
-        latest = getattr(self, "_last_assistant_message_text", "")
-        if not latest.strip():
+    def _copy_assistant_text(self, text: str, *, success_message: str) -> tuple[bool, str]:
+        if not text.strip():
             return False, "No assistant reply yet to copy."
 
         from hermes_cli.clipboard import copy_text_to_clipboard
 
-        ok, error = copy_text_to_clipboard(latest)
+        ok, error = copy_text_to_clipboard(text)
         if ok:
-            return True, "Copied latest assistant reply to the system clipboard."
+            return True, success_message
         if error:
             return False, f"Clipboard copy failed: {error}"
         return False, "Clipboard copy failed."
+
+    def _copy_assistant_message_by_id(self, message_id: int) -> tuple[bool, str]:
+        self._ensure_assistant_copy_state()
+        for entry_id, text in self._assistant_copy_entries:
+            if entry_id == message_id:
+                return self._copy_assistant_text(
+                    text,
+                    success_message=f"Copied reply #{message_id} to the system clipboard.",
+                )
+        return False, f"No assistant reply #{message_id} is available to copy."
+
+    def _copy_latest_assistant_message(self) -> tuple[bool, str]:
+        """Copy the latest assistant reply shown in the interactive chat."""
+        self._ensure_assistant_copy_state()
+        latest = self._last_assistant_message_text
+        return self._copy_assistant_text(
+            latest,
+            success_message="Copied latest assistant reply to the system clipboard.",
+        )
 
     def _register_copy_shortcut(self, kb: KeyBindings) -> None:
         """Bind Alt+C to copy the latest assistant reply."""
@@ -2857,6 +2912,408 @@ class HermesCLI:
             ok, message = self._copy_latest_assistant_message()
             icon = "⧉" if ok else "⚠"
             _cprint(f"  {_DIM}{icon} {message}{_RST}")
+            event.app.invalidate()
+
+    def _current_profile_name(self) -> str:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            return get_active_profile_name()
+        except Exception:
+            return "default"
+
+    def _refresh_agent_browser_snapshot(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._agent_browser_last_refresh) < 2.0:
+            return
+        try:
+            from hermes_cli.agent_browser import build_profile_cards
+
+            cards = build_profile_cards(current_profile_name=self._current_profile_name())
+            with self._agent_browser_generation_lock:
+                refreshing = set(self._agent_browser_generation_jobs)
+            for card in cards:
+                if card.name in refreshing:
+                    card.refreshing = True
+                    card.wired = True
+                    card.wire_state = "refreshing"
+            self._agent_browser_cards = cards
+            if self._agent_browser_cards:
+                self._agent_browser_selected_index = max(
+                    0,
+                    min(self._agent_browser_selected_index, len(self._agent_browser_cards) - 1),
+                )
+            else:
+                self._agent_browser_selected_index = 0
+            self._agent_browser_last_refresh = now
+        except Exception as exc:
+            logger.debug("Agent browser snapshot refresh failed: %s", exc)
+
+    def _select_agent_browser_profile(self, profile_name: str) -> None:
+        for idx, card in enumerate(self._agent_browser_cards):
+            if card.name == profile_name:
+                self._agent_browser_selected_index = idx
+                return
+
+    def _selected_agent_browser_card(self):
+        if not self._agent_browser_cards:
+            return None
+        idx = max(0, min(self._agent_browser_selected_index, len(self._agent_browser_cards) - 1))
+        return self._agent_browser_cards[idx]
+
+    def _queue_agent_browser_status_refresh(self, profile_name: str | None = None) -> bool:
+        target = (profile_name or self._current_profile_name()).strip()
+        if not target or target == "custom":
+            return False
+        with self._agent_browser_generation_lock:
+            if target in self._agent_browser_generation_jobs:
+                return False
+            self._agent_browser_generation_jobs.add(target)
+
+        def _worker() -> None:
+            try:
+                from hermes_cli.agent_browser import collect_presence, generate_reflective_status, save_status
+                from hermes_cli.profiles import get_profile_dir
+
+                profile_dir = get_profile_dir(target)
+                current_profile = self._current_profile_name()
+                use_live_context = target == current_profile
+                presence = collect_presence(profile_dir)
+                payload = generate_reflective_status(
+                    profile_dir,
+                    profile_name=target,
+                    session_id=self.session_id if use_live_context else "",
+                    conversation_history=(list(self.conversation_history) if use_live_context else None),
+                    wired=bool(presence.get("wired") or use_live_context),
+                )
+                save_status(profile_dir, payload)
+            except Exception as exc:
+                logger.debug("Agent browser status refresh failed for %s: %s", target, exc)
+            finally:
+                with self._agent_browser_generation_lock:
+                    self._agent_browser_generation_jobs.discard(target)
+                self._refresh_agent_browser_snapshot(force=True)
+                self._invalidate(min_interval=0.0)
+
+        threading.Thread(target=_worker, daemon=True, name=f"agent-browser-status-{target}").start()
+        self._refresh_agent_browser_snapshot(force=True)
+        return True
+
+    def _toggle_agent_browser(self, open_state: bool | None = None) -> bool:
+        desired = (not self._agent_browser_open) if open_state is None else bool(open_state)
+        if desired:
+            self._agent_browser_open = True
+            self._refresh_agent_browser_snapshot(force=True)
+            self._select_agent_browser_profile(self._current_profile_name())
+            self._queue_agent_browser_status_refresh(self._current_profile_name())
+        else:
+            self._agent_browser_open = False
+        self._invalidate(min_interval=0.0)
+        return self._agent_browser_open
+
+    def _set_agent_browser_columns(self, columns: int) -> int:
+        self._agent_browser_columns = 3
+        self._invalidate(min_interval=0.0)
+        return self._agent_browser_columns
+
+    def _agent_browser_canvas_size(self) -> tuple[int, int]:
+        output = getattr(getattr(self, "_app", None), "output", None)
+        if output is not None:
+            size = output.get_size()
+            width = max(72, int(getattr(size, "columns", 100) or 100) - 2)
+            height = max(18, int(getattr(size, "rows", 30) or 30) - 6)
+            return width, height
+        return 100, 24
+
+    def _agent_browser_effective_columns(self) -> int:
+        if not self._agent_browser_cards:
+            return 1
+        try:
+            from hermes_cli.agent_browser import compute_browser_layout
+
+            width, height = self._agent_browser_canvas_size()
+            layout = compute_browser_layout(
+                len(self._agent_browser_cards),
+                width=width,
+                height=height,
+                columns=self._agent_browser_columns,
+            )
+            return max(1, int(getattr(layout, "effective_columns", 1) or 1))
+        except Exception:
+            return max(1, min(3, len(self._agent_browser_cards)))
+
+    def _move_agent_browser_selection(self, delta: int) -> None:
+        if not self._agent_browser_cards:
+            return
+        self._agent_browser_selected_index = max(
+            0,
+            min(self._agent_browser_selected_index + delta, len(self._agent_browser_cards) - 1),
+        )
+        self._invalidate(min_interval=0.0)
+
+    def _move_agent_browser_vertical(self, row_delta: int) -> None:
+        step = self._agent_browser_effective_columns()
+        self._move_agent_browser_selection(step * row_delta)
+
+    def _refresh_selected_agent_browser_profile(self) -> bool:
+        selected = self._selected_agent_browser_card()
+        if not selected:
+            return False
+        return self._queue_agent_browser_status_refresh(selected.name)
+
+    def _activate_agent_browser_selection(self, *, event_app=None) -> dict[str, str] | None:
+        selected = self._selected_agent_browser_card()
+        if not selected:
+            return None
+        target = selected.name
+        current = self._current_profile_name()
+        if target == current:
+            self._toggle_agent_browser(False)
+            return {"action": "close", "profile": target}
+        if self._launch_agent_browser_target(target):
+            self._toggle_agent_browser(False)
+            return {"action": "launch", "profile": target}
+        logger.debug("Agent browser could not open sibling session for %s", target)
+        return {"action": "unavailable", "profile": target}
+
+    def _render_agent_browser(self):
+        try:
+            from hermes_cli.agent_browser import render_browser
+
+            width, height = self._agent_browser_canvas_size()
+            return _PT_ANSI(
+                render_browser(
+                    self._agent_browser_cards,
+                    selected_index=self._agent_browser_selected_index,
+                    width=width,
+                    height=height,
+                    columns=self._agent_browser_columns,
+                )
+            )
+        except Exception as exc:
+            logger.debug("Agent browser render failed: %s", exc)
+            return "Agent browser unavailable."
+
+    def _build_agent_browser_widget(self):
+        return ConditionalContainer(
+            Window(
+                content=FormattedTextControl(lambda: self._render_agent_browser()),
+                wrap_lines=False,
+            ),
+            filter=Condition(lambda: bool(self._agent_browser_open)),
+        )
+
+    def _sync_agent_browser_runtime(self) -> None:
+        now = time.monotonic()
+        if (now - self._agent_browser_last_presence_write) >= 1.5:
+            try:
+                from hermes_cli.agent_browser import write_presence
+                from hermes_cli.profiles import get_profile_dir
+
+                current = self._current_profile_name()
+                if current != "custom":
+                    write_presence(
+                        get_profile_dir(current),
+                        pid=os.getpid(),
+                        session_id=self.session_id,
+                        profile_name=current,
+                        busy=bool(self._agent_running or self._command_running),
+                        model=self.model or "",
+                    )
+                self._agent_browser_last_presence_write = now
+            except Exception as exc:
+                logger.debug("Agent browser presence write failed: %s", exc)
+        if self._agent_browser_open and (now - self._agent_browser_last_refresh) >= 2.0:
+            self._refresh_agent_browser_snapshot(force=True)
+
+    def _cleanup_agent_browser_runtime(self) -> None:
+        try:
+            from hermes_cli.agent_browser import remove_presence
+            from hermes_cli.profiles import get_profile_dir
+
+            current = self._current_profile_name()
+            if current != "custom":
+                remove_presence(get_profile_dir(current), os.getpid())
+        except Exception:
+            pass
+
+    def _build_agent_browser_launch_command(self, target: str) -> tuple[list[str], dict[str, str], str]:
+        from hermes_cli.profiles import get_profile_dir
+
+        cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(get_profile_dir(target))
+
+        script = sys.argv[0]
+        script_path = ""
+        if os.path.isabs(script) or os.path.sep in script:
+            script_path = str(Path(script).resolve())
+        else:
+            script_path = shutil.which(script) or shutil.which("hermes") or ""
+
+        argv: list[str]
+        if script_path and Path(script_path).exists():
+            if os.access(script_path, os.X_OK):
+                argv = [script_path, "-p", target]
+            else:
+                argv = [sys.executable, script_path, "-p", target]
+        else:
+            hermes_bin = shutil.which("hermes")
+            if hermes_bin:
+                argv = [hermes_bin, "-p", target]
+            else:
+                argv = [sys.executable, "-m", "hermes_cli.main", "-p", target]
+        return argv, env, cwd
+
+    def _launch_agent_browser_target(self, target: str | None = None) -> bool:
+        launch_target = (target or self._agent_browser_launch_target or "").strip()
+        self._agent_browser_launch_target = None
+        if not launch_target:
+            return False
+        try:
+            argv, env, cwd = self._build_agent_browser_launch_command(launch_target)
+        except Exception as exc:
+            logger.debug("Agent browser launch setup failed for %s: %s", launch_target, exc)
+            return False
+
+        command_str = shlex.join([str(part) for part in argv])
+        last_error: Exception | None = None
+        launch_attempts: list[tuple[list[str], dict[str, str], str | None]] = []
+
+        tmux_bin = shutil.which("tmux") if os.environ.get("TMUX") else None
+        if tmux_bin:
+            tmux_command = f"env HERMES_HOME={shlex.quote(env['HERMES_HOME'])} {command_str}"
+            launch_attempts.append((
+                [tmux_bin, "new-window", "-n", f"hermes:{launch_target}", "-c", cwd, tmux_command],
+                os.environ.copy(),
+                None,
+            ))
+
+        shell_command = (
+            f"{command_str}; code=$?; "
+            "if [ \"$code\" -ne 0 ]; then "
+            "printf '\nHermes launch failed (exit %s). Press Enter to close...' \"$code\"; "
+            "read -r _; "
+            "fi; exit \"$code\""
+        )
+
+        for terminal_cmd in (
+            shutil.which("x-terminal-emulator"),
+            shutil.which("gnome-terminal"),
+            shutil.which("kitty"),
+            shutil.which("wezterm"),
+            shutil.which("alacritty"),
+            shutil.which("konsole"),
+        ):
+            if not terminal_cmd:
+                continue
+            base = os.path.basename(terminal_cmd)
+            if base == "x-terminal-emulator":
+                argv_cmd = [terminal_cmd, "-e", "sh", "-lc", shell_command]
+            elif base == "gnome-terminal":
+                argv_cmd = [terminal_cmd, "--", "sh", "-lc", shell_command]
+            elif base == "kitty":
+                argv_cmd = [terminal_cmd, "sh", "-lc", shell_command]
+            elif base == "wezterm":
+                argv_cmd = [terminal_cmd, "start", "--cwd", cwd, "--", "sh", "-lc", shell_command]
+            elif base == "alacritty":
+                argv_cmd = [terminal_cmd, "--working-directory", cwd, "-e", "sh", "-lc", shell_command]
+            elif base == "konsole":
+                argv_cmd = [terminal_cmd, "--workdir", cwd, "-e", "sh", "-lc", shell_command]
+            else:
+                continue
+            launch_attempts.append((argv_cmd, env, cwd))
+
+        for argv_cmd, env_cmd, cwd_cmd in launch_attempts:
+            try:
+                subprocess.Popen(
+                    argv_cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    env=env_cmd,
+                    cwd=cwd_cmd,
+                )
+                return True
+            except Exception as exc:
+                last_error = exc
+                logger.debug("Agent browser launcher failed for %s via %s: %s", launch_target, argv_cmd[0], exc)
+
+        if last_error is not None:
+            logger.debug("Agent browser could not open %s in a sibling terminal: %s", launch_target, last_error)
+        else:
+            logger.debug("Agent browser found no sibling-terminal launcher for %s", launch_target)
+        return False
+
+    def _register_agent_browser_shortcuts(self, kb: KeyBindings, *, input_area=None) -> None:
+        browser_open = Condition(lambda: bool(self._agent_browser_open and not self._voice_mode))
+        browser_closed = Condition(lambda: bool((not self._agent_browser_open) and (not self._voice_mode)))
+
+        @kb.add('c-b', filter=browser_closed)
+        def handle_open_agent_browser(event):
+            self._toggle_agent_browser(True)
+            event.app.invalidate()
+
+        @kb.add('c-b', filter=browser_open)
+        def handle_close_agent_browser(event):
+            self._toggle_agent_browser(False)
+            event.app.invalidate()
+
+        @kb.add('escape', eager=True, filter=browser_open)
+        def handle_escape_agent_browser(event):
+            self._toggle_agent_browser(False)
+            event.app.invalidate()
+
+        @kb.add('left', filter=browser_open)
+        def handle_agent_browser_left(event):
+            self._move_agent_browser_selection(-1)
+            event.app.invalidate()
+
+        @kb.add('right', filter=browser_open)
+        def handle_agent_browser_right(event):
+            self._move_agent_browser_selection(1)
+            event.app.invalidate()
+
+        @kb.add('up', filter=browser_open)
+        def handle_agent_browser_up(event):
+            self._move_agent_browser_vertical(-1)
+            event.app.invalidate()
+
+        @kb.add('down', filter=browser_open)
+        def handle_agent_browser_down(event):
+            self._move_agent_browser_vertical(1)
+            event.app.invalidate()
+
+        @kb.add('pageup', filter=browser_open)
+        def handle_agent_browser_pageup(event):
+            self._move_agent_browser_vertical(-2)
+            event.app.invalidate()
+
+        @kb.add('pagedown', filter=browser_open)
+        def handle_agent_browser_pagedown(event):
+            self._move_agent_browser_vertical(2)
+            event.app.invalidate()
+
+        @kb.add('home', filter=browser_open)
+        def handle_agent_browser_home(event):
+            self._agent_browser_selected_index = 0
+            event.app.invalidate()
+
+        @kb.add('end', filter=browser_open)
+        def handle_agent_browser_end(event):
+            if self._agent_browser_cards:
+                self._agent_browser_selected_index = len(self._agent_browser_cards) - 1
+            event.app.invalidate()
+
+        @kb.add('r', filter=browser_open)
+        def handle_agent_browser_refresh(event):
+            self._refresh_selected_agent_browser_profile()
+            event.app.invalidate()
+
+        @kb.add('q', filter=browser_open)
+        def handle_agent_browser_quit(event):
+            self._toggle_agent_browser(False)
             event.app.invalidate()
 
     def _handle_rollback_command(self, command: str):
@@ -2967,23 +3424,34 @@ class HermesCLI:
             return ref
 
     def _handle_stop_command(self):
-        """Handle /stop — kill all running background processes.
+        """Handle /stop — kill all running background processes."""
+        try:
+            from tools.process_registry import _PROCESS_REGISTRY
+            killed = _PROCESS_REGISTRY.kill_all()
+            if killed:
+                _cprint(f"  ✓ Killed {killed} background process{'es' if killed != 1 else ''}")
+            else:
+                _cprint("  No background processes running")
+        except Exception as e:
+            _cprint(f"  Error stopping background processes: {e}")
 
-        Inspired by OpenAI Codex's separation of interrupt (stop current turn)
-        from /stop (clean up background processes). See openai/codex#14602.
-        """
-        from tools.process_registry import process_registry
+    def _handle_copy_command(self, command: str) -> None:
+        """Handle /copy [message-number] — copy an assistant reply to the clipboard."""
+        parts = command.split(None, 1)
+        target = parts[1].strip() if len(parts) > 1 else ""
 
-        processes = process_registry.list_sessions()
-        running = [p for p in processes if p.get("status") == "running"]
+        if not target or target.lower() in {"last", "latest"}:
+            ok, message = self._copy_latest_assistant_message()
+        else:
+            try:
+                message_id = int(target)
+            except ValueError:
+                _cprint("  Usage: /copy [message-number]")
+                return
+            ok, message = self._copy_assistant_message_by_id(message_id)
 
-        if not running:
-            print("  No running background processes.")
-            return
-
-        print(f"  Stopping {len(running)} background process(es)...")
-        killed = process_registry.kill_all()
-        print(f"  ✅ Stopped {killed} process(es).")
+        icon = "⧉" if ok else "⚠"
+        _cprint(f"  {_DIM}{icon} {message}{_RST}")
 
     def _handle_paste_command(self):
         """Handle /paste — explicitly check clipboard for an image.
@@ -3065,6 +3533,32 @@ class HermesCLI:
             return f"{prefix}\n\n{user_text}" if user_text else prefix
         return user_text or "What do you see in this image?"
 
+    def _prepare_user_message_with_images(self, message, images: list, turn_route: dict):
+        if not images:
+            return message
+
+        from run_agent import (
+            build_native_multimodal_user_content,
+            message_content_to_text,
+            supports_native_multimodal_input,
+        )
+
+        runtime = (turn_route or {}).get("runtime") or {}
+        if supports_native_multimodal_input(
+            provider=runtime.get("provider"),
+            api_mode=runtime.get("api_mode"),
+            base_url=runtime.get("base_url"),
+        ):
+            return build_native_multimodal_user_content(
+                message_content_to_text(message),
+                images,
+            )
+
+        return self._preprocess_images_with_vision(
+            message if isinstance(message, str) else message_content_to_text(message),
+            images,
+        )
+
     def _show_tool_availability_warnings(self):
         """Show warnings about disabled tools due to missing API keys."""
         try:
@@ -3089,8 +3583,10 @@ class HermesCLI:
     
     def _show_status(self):
         """Show current status bar."""
-        # Get tool count
-        tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+        if self.agent is not None:
+            tools = self.agent.refresh_tool_surface(quiet_mode=True, invalidate_prompt=False)
+        else:
+            tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
         tool_count = len(tools) if tools else 0
         
         # Format model name (shorten if needed)
@@ -3150,11 +3646,15 @@ class HermesCLI:
 
         _cprint(f"\n  {_DIM}Tip: Just type your message to chat with Hermes!{_RST}")
         _cprint(f"  {_DIM}Multi-line: Alt+Enter for a new line{_RST}")
+        _cprint(f"  {_DIM}Copy replies: Alt+C copies latest; /copy [n] copies a specific reply{_RST}")
         _cprint(f"  {_DIM}Paste image: Alt+V (or /paste){_RST}\n")
     
     def show_tools(self):
         """Display available tools with kawaii ASCII art."""
-        tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+        if self.agent is not None:
+            tools = self.agent.refresh_tool_surface(quiet_mode=True, invalidate_prompt=False)
+        else:
+            tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
         
         if not tools:
             print("(;_;) No tools available")
@@ -3499,6 +3999,7 @@ class HermesCLI:
         short_uuid = uuid.uuid4().hex[:6]
         self.session_id = f"{timestamp_str}_{short_uuid}"
         self.conversation_history = []
+        self._reset_assistant_copy_state()
         self._pending_title = None
         self._resumed = False
         self.codex_service_tier = None
@@ -3584,6 +4085,7 @@ class HermesCLI:
         restored = self._session_db.get_messages_as_conversation(target_id)
         restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
         self.conversation_history = restored
+        self._reset_assistant_copy_state()
 
         # Re-open the target session so it's not marked as ended
         try:
@@ -3779,34 +4281,34 @@ class HermesCLI:
         return last_message
     
     def undo_last(self):
-        """Remove the last user/assistant exchange from conversation history.
+        """Remove the last visible user turn from conversation history.
         
-        Walks backwards and removes all messages from the last user message
-        onward (including assistant responses, tool calls, etc.).
+        Internally this may delete multiple transcript entries (tool calls,
+        tool results, intermediate assistant messages), but it is always one
+        user-visible turn.
         """
         if not self.conversation_history:
             print("(._.) No messages to undo.")
             return
-        
-        # Walk backwards to find the last user message
-        last_user_idx = None
-        for i in range(len(self.conversation_history) - 1, -1, -1):
-            if self.conversation_history[i].get("role") == "user":
-                last_user_idx = i
-                break
-        
-        if last_user_idx is None:
+
+        from run_agent import (
+            format_internal_transcript_message_count,
+            summarize_last_user_turn,
+        )
+
+        summary = summarize_last_user_turn(self.conversation_history)
+        if not summary:
             print("(._.) No user message found to undo.")
             return
-        
-        # Count how many messages we're removing
-        removed_count = len(self.conversation_history) - last_user_idx
-        removed_msg = self.conversation_history[last_user_idx].get("content", "")
-        
-        # Truncate history to before the last user message
-        self.conversation_history = self.conversation_history[:last_user_idx]
-        
-        print(f"(^_^)b Undid {removed_count} message(s). Removed: \"{removed_msg[:60]}{'...' if len(removed_msg) > 60 else ''}\"")
+
+        self.conversation_history = summary["truncated_history"]
+        removed_count = int(summary["removed_count"])
+        removed_preview = summary["preview"]
+
+        print(
+            f"(^_^)b Undid 1 turn ({format_internal_transcript_message_count(removed_count)})."
+        )
+        print(f"  Removed your last message: \"{removed_preview}\"")
         remaining = len(self.conversation_history)
         print(f"  {remaining} message(s) remaining in history.")
     
@@ -4654,6 +5156,8 @@ class HermesCLI:
             self._show_usage()
         elif canonical == "insights":
             self._show_insights(cmd_original)
+        elif canonical == "copy":
+            self._handle_copy_command(cmd_original)
         elif canonical == "paste":
             self._handle_paste_command()
         elif canonical == "reload-mcp":
@@ -4928,7 +5432,7 @@ class HermesCLI:
                 _cprint(f"  Prompt: \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
                 ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
                 if response:
-                    self._remember_assistant_message(response)
+                    copy_id = self._remember_assistant_message(response)
                     try:
                         from hermes_cli.skin_engine import get_active_skin
                         _skin = get_active_skin()
@@ -4950,7 +5454,7 @@ class HermesCLI:
                         box=rich_box.HORIZONTALS,
                         padding=(1, 2),
                     ))
-                    self._show_assistant_copy_hint()
+                    self._show_assistant_copy_hint(copy_id)
                 else:
                     _cprint("  (No response generated)")
 
@@ -5058,7 +5562,7 @@ class HermesCLI:
                 print()
 
                 if response:
-                    self._remember_assistant_message(response)
+                    copy_id = self._remember_assistant_message(response)
                     try:
                         from hermes_cli.skin_engine import get_active_skin
                         _skin = get_active_skin()
@@ -5074,7 +5578,7 @@ class HermesCLI:
                         box=rich_box.HORIZONTALS,
                         padding=(1, 2),
                     ))
-                    self._show_assistant_copy_hint()
+                    self._show_assistant_copy_hint(copy_id)
                 else:
                     _cprint("  💬 /btw: (no response)")
 
@@ -5711,15 +6215,7 @@ class HermesCLI:
 
             # Refresh the agent's tool list so the model can call new tools
             if self.agent is not None:
-                from model_tools import get_tool_definitions
-                self.agent.tools = get_tool_definitions(
-                    enabled_toolsets=self.agent.enabled_toolsets
-                    if hasattr(self.agent, "enabled_toolsets") else None,
-                    quiet_mode=True,
-                )
-                self.agent.valid_tool_names = {
-                    tool["function"]["name"] for tool in self.agent.tools
-                } if self.agent.tools else set()
+                self.agent.refresh_tool_surface(quiet_mode=True, invalidate_prompt=True)
 
             # Inject a message at the END of conversation history so the
             # model knows tools changed.  Appended after all existing
@@ -6555,13 +7051,8 @@ class HermesCLI:
         ):
             return None
         
-        # Pre-process images through the vision tool (Gemini Flash) so the
-        # main model receives text descriptions instead of raw base64 image
-        # content — works with any model, not just vision-capable ones.
         if images:
-            message = self._preprocess_images_with_vision(
-                message if isinstance(message, str) else "", images
-            )
+            message = self._prepare_user_message_with_images(message, images, turn_route)
 
         # Expand @ context references (e.g. @file:main.py, @diff, @folder:src/)
         if isinstance(message, str) and "@" in message:
@@ -6683,7 +7174,9 @@ class HermesCLI:
                 # Prepend pending model switch note so the model knows about the switch
                 _msn = getattr(self, '_pending_model_switch_note', None)
                 if _msn:
-                    agent_message = _msn + "\n\n" + agent_message
+                    from run_agent import prepend_text_to_message_content
+
+                    agent_message = prepend_text_to_message_content(agent_message, _msn)
                     self._pending_model_switch_note = None
                 try:
                     result = self.agent.run_conversation(
@@ -6825,8 +7318,7 @@ class HermesCLI:
                     response = response + "\n\n---\n_[Interrupted - processing new message]_"
 
             response_previewed = result.get("response_previewed", False) if result else False
-            if response:
-                self._remember_assistant_message(response)
+            copy_id = self._remember_assistant_message(response) if response else None
 
             # Display reasoning (thinking) box if enabled and available.
             # Skip when streaming already showed reasoning live.  Use the
@@ -6888,7 +7380,7 @@ class HermesCLI:
                     ))
 
             if response:
-                self._show_assistant_copy_hint()
+                self._show_assistant_copy_hint(copy_id)
 
             # Play terminal bell when agent finishes (if enabled).
             # Works over SSH — the bell propagates to the user's terminal.
@@ -7046,6 +7538,8 @@ class HermesCLI:
     def _get_tui_prompt_fragments(self):
         """Return the prompt_toolkit fragments for the current interactive state."""
         symbol, state_suffix = self._get_tui_prompt_symbols()
+        if self._agent_browser_open:
+            return [("class:prompt-working", "▣ browse ")]
         if self._voice_recording:
             bar = self._audio_level_bar()
             return [("class:voice-recording", f"● {bar} {state_suffix}")]
@@ -7279,6 +7773,7 @@ class HermesCLI:
         # Key bindings for the input area
         kb = KeyBindings()
         self._register_copy_shortcut(kb)
+        self._register_agent_browser_shortcuts(kb)
         
         @kb.add('enter')
         def handle_enter(event):
@@ -7294,6 +7789,11 @@ class HermesCLI:
             Commands (starting with /) always go to _pending_input so they're
             handled as commands, not sent as interrupt text to the agent.
             """
+            if self._agent_browser_open:
+                self._activate_agent_browser_selection(event_app=event.app)
+                event.app.invalidate()
+                return
+
             # --- Sudo password prompt: submit the typed password ---
             if self._sudo_state:
                 text = event.app.current_buffer.text
@@ -7588,7 +8088,7 @@ class HermesCLI:
         except Exception:
             _voice_key = "c-b"
 
-        @kb.add(_voice_key)
+        @kb.add(_voice_key, filter=Condition(lambda: bool(cli_ref._voice_mode)))
         def handle_voice_record(event):
             """Toggle voice recording when voice mode is active.
 
@@ -7735,7 +8235,7 @@ class HermesCLI:
             style='class:input-area',
             multiline=True,
             wrap_lines=True,
-            read_only=Condition(lambda: bool(cli_ref._command_running)),
+            read_only=Condition(lambda: bool(cli_ref._command_running or cli_ref._agent_browser_open)),
             history=FileHistory(str(self._history_file)),
             completer=_completer,
             complete_while_typing=True,
@@ -8202,25 +8702,28 @@ class HermesCLI:
         # the corresponding interactive prompt is active.
         completions_menu = CompletionsMenu(max_height=12, scroll_offset=1)
 
-        layout = Layout(
-            HSplit(
-                self._build_tui_layout_children(
-                    sudo_widget=sudo_widget,
-                    secret_widget=secret_widget,
-                    approval_widget=approval_widget,
-                    clarify_widget=clarify_widget,
-                    spinner_widget=spinner_widget,
-                    spacer=spacer,
-                    status_bar=status_bar,
-                    input_rule_top=input_rule_top,
-                    image_bar=image_bar,
-                    input_area=input_area,
-                    input_rule_bot=input_rule_bot,
-                    voice_status_bar=voice_status_bar,
-                    completions_menu=completions_menu,
-                )
-            )
+        layout_children = self._build_tui_layout_children(
+            sudo_widget=sudo_widget,
+            secret_widget=secret_widget,
+            approval_widget=approval_widget,
+            clarify_widget=clarify_widget,
+            spinner_widget=spinner_widget,
+            spacer=spacer,
+            status_bar=status_bar,
+            input_rule_top=input_rule_top,
+            image_bar=image_bar,
+            input_area=input_area,
+            input_rule_bot=input_rule_bot,
+            voice_status_bar=voice_status_bar,
+            completions_menu=completions_menu,
         )
+        try:
+            _status_idx = layout_children.index(status_bar)
+        except ValueError:
+            _status_idx = len(layout_children)
+        layout_children.insert(_status_idx, self._build_agent_browser_widget())
+
+        layout = Layout(HSplit(layout_children))
         
         # Style for the application
         self._tui_style_base = {
@@ -8333,6 +8836,10 @@ class HermesCLI:
 
             last_idle_refresh = 0.0
             while not self._should_exit:
+                try:
+                    self._sync_agent_browser_runtime()
+                except Exception:
+                    pass
                 if not self._app:
                     _time.sleep(0.1)
                     continue
@@ -8613,6 +9120,9 @@ class HermesCLI:
                 except Exception:
                     pass
             _run_cleanup()
+            self._cleanup_agent_browser_runtime()
+            if self._launch_agent_browser_target():
+                return
             self._print_exit_summary()
 
 
