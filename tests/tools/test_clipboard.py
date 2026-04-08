@@ -844,6 +844,10 @@ class TestCopyLatestAssistantMessage:
                 "Clipboard copy failed: xclip missing",
             )
 
+    def test_remember_assistant_message_noops_without_overlay_sink(self, cli):
+        cli._remember_assistant_message("hello from hermes")
+        assert cli._last_assistant_message_text == "hello from hermes"
+
 
 # ═════════════════════════════════════════════════════════════════════════
 # Level 3: _preprocess_images_with_vision — image → text via vision tool

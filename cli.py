@@ -2829,6 +2829,10 @@ class HermesCLI:
             self._last_assistant_message_text = plain
             self._publish_latest_reply_to_overlay(plain)
 
+    def _publish_latest_reply_to_overlay(self, text: str) -> None:
+        """Hook for wrapper CLIs with overlays; base Hermes has no overlay sink."""
+        return None
+
     def _show_assistant_copy_hint(self) -> None:
         if not getattr(self, "_app", None):
             return
@@ -3064,6 +3068,32 @@ class HermesCLI:
             prefix = "\n\n".join(enriched_parts)
             return f"{prefix}\n\n{user_text}" if user_text else prefix
         return user_text or "What do you see in this image?"
+
+    def _prepare_user_message_with_images(self, message, images: list, turn_route: dict):
+        if not images:
+            return message
+
+        from run_agent import (
+            build_native_multimodal_user_content,
+            message_content_to_text,
+            supports_native_multimodal_input,
+        )
+
+        runtime = (turn_route or {}).get("runtime") or {}
+        if supports_native_multimodal_input(
+            provider=runtime.get("provider"),
+            api_mode=runtime.get("api_mode"),
+            base_url=runtime.get("base_url"),
+        ):
+            return build_native_multimodal_user_content(
+                message_content_to_text(message),
+                images,
+            )
+
+        return self._preprocess_images_with_vision(
+            message if isinstance(message, str) else message_content_to_text(message),
+            images,
+        )
 
     def _show_tool_availability_warnings(self):
         """Show warnings about disabled tools due to missing API keys."""
@@ -6540,13 +6570,8 @@ class HermesCLI:
         ):
             return None
         
-        # Pre-process images through the vision tool (Gemini Flash) so the
-        # main model receives text descriptions instead of raw base64 image
-        # content — works with any model, not just vision-capable ones.
         if images:
-            message = self._preprocess_images_with_vision(
-                message if isinstance(message, str) else "", images
-            )
+            message = self._prepare_user_message_with_images(message, images, turn_route)
 
         # Expand @ context references (e.g. @file:main.py, @diff, @folder:src/)
         if isinstance(message, str) and "@" in message:
