@@ -72,6 +72,27 @@ def test_get_platform_tools_keeps_enabled_mcp_servers_with_explicit_builtin_sele
     assert "web-search-prime" in enabled
 
 
+def test_get_platform_tools_auto_enables_new_default_on_builtin_toolset_once():
+    config = {
+        "platform_toolsets": {"cli": ["web", "memory"]},
+    }
+
+    enabled = _get_platform_tools(config, "cli")
+
+    assert "docs" in enabled
+
+
+def test_get_platform_tools_respects_saved_disable_of_new_builtin_toolset():
+    config = {
+        "platform_toolsets": {"cli": ["web", "memory"]},
+        "known_builtin_toolsets": {"cli": ["web", "docs", "memory"]},
+    }
+
+    enabled = _get_platform_tools(config, "cli")
+
+    assert "docs" not in enabled
+
+
 def test_get_platform_tools_no_mcp_sentinel_excludes_all_mcp_servers():
     """The 'no_mcp' sentinel in platform_toolsets excludes all MCP servers."""
     config = {
@@ -165,6 +186,7 @@ def test_save_platform_tools_handles_empty_existing_config():
     saved_toolsets = config["platform_toolsets"]["telegram"]
     assert "web" in saved_toolsets
     assert "terminal" in saved_toolsets
+    assert "docs" in config["known_builtin_toolsets"]["telegram"]
 
 
 def test_save_platform_tools_handles_invalid_existing_config():

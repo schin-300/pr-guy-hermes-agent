@@ -68,6 +68,7 @@ def _prompt(question: str, default: str = None, password: bool = False) -> str:
 # These map to keys in toolsets.py TOOLSETS dict.
 CONFIGURABLE_TOOLSETS = [
     ("web",             "🔍 Web Search & Scraping",    "web_search, web_extract"),
+    ("docs",            "📚 Hermes Public Docs",        "hermes_docs_lookup (public upstream docs/code)"),
     ("browser",         "🌐 Browser Automation",       "navigate, click, type, scroll"),
     ("terminal",        "💻 Terminal & Processes",      "terminal, process"),
     ("file",            "📁 File Operations",           "read, write, patch, search"),
@@ -91,6 +92,10 @@ CONFIGURABLE_TOOLSETS = [
 # They're still in _HERMES_CORE_TOOLS (available at runtime if enabled),
 # but the setup checklist won't pre-select them for first-time users.
 _DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "rl"}
+
+# New built-in toolsets that should default to enabled for existing configs
+# until the user has seen/saved them explicitly once.
+_NEW_DEFAULT_ON_BUILTIN_TOOLSETS = {"docs"}
 
 
 def _get_effective_configurable_toolsets():
@@ -510,6 +515,12 @@ def _get_platform_tools(
 
     if has_explicit_config:
         enabled_toolsets = {ts for ts in toolset_names if ts in configurable_keys}
+
+        known_builtin_map = config.get("known_builtin_toolsets", {})
+        known_builtin_for_platform = set(known_builtin_map.get(platform, []))
+        for ts in _NEW_DEFAULT_ON_BUILTIN_TOOLSETS:
+            if ts in configurable_keys and ts not in toolset_names and ts not in known_builtin_for_platform:
+                enabled_toolsets.add(ts)
     else:
         # No explicit config — fall back to resolving composite toolset names
         # (e.g. "hermes-cli") to individual tool names and reverse-mapping.
@@ -612,6 +623,13 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
 
     # Merge preserved entries with new enabled toolsets
     config["platform_toolsets"][platform] = sorted(enabled_toolset_keys | preserved_entries)
+
+    # Track which built-in configurable toolsets are "known" for this platform
+    # so newly introduced default-on built-ins (e.g. docs lookup) can auto-enable
+    # once, then respect later user disables after the next save.
+    builtin_configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
+    config.setdefault("known_builtin_toolsets", {})
+    config["known_builtin_toolsets"][platform] = sorted(builtin_configurable_keys)
 
     # Track which plugin toolsets are "known" for this platform so we can
     # distinguish "new plugin, default enabled" from "user disabled it".
