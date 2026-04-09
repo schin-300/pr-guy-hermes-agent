@@ -15,13 +15,22 @@ Constraints
 
 from __future__ import annotations
 
+import array
+import base64
+import fcntl
 import locale
+import math
+import os
+import struct
 import sys
+import termios
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import count
 from typing import Any, Callable, Optional
 
 import httpx
@@ -38,6 +47,118 @@ DEFAULT_PROVIDER = "openai-codex"
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 WEEKLY_RESET_GAP_SECONDS = 3 * 24 * 60 * 60
 MAX_POLL_WORKERS = 8
+AUTO_REFRESH_INTERVAL_SECONDS = 30.0
+KITTY_METER_MIN_WIDTH = 96
+KITTY_METER_MIN_HEIGHT = 20
+MAX_POOL_DRAIN_SAMPLES = 64
+_KITTY_PLACEHOLDER = "\U0010EEEE"
+_KITTY_CHUNK_SIZE = 4096
+_DEFAULT_CELL_PIXELS = (10, 20)
+_KITTY_DIACRITIC_CODEPOINTS = (
+    0x0305,
+    0x030D,
+    0x030E,
+    0x0310,
+    0x0312,
+    0x033D,
+    0x033E,
+    0x033F,
+    0x0346,
+    0x034A,
+    0x034B,
+    0x034C,
+    0x0350,
+    0x0351,
+    0x0352,
+    0x0357,
+    0x035B,
+    0x0363,
+    0x0364,
+    0x0365,
+    0x0366,
+    0x0367,
+    0x0368,
+    0x0369,
+    0x036A,
+    0x036B,
+    0x036C,
+    0x036D,
+    0x036E,
+    0x036F,
+    0x0483,
+    0x0484,
+    0x0485,
+    0x0486,
+    0x0487,
+    0x0592,
+    0x0593,
+    0x0594,
+    0x0595,
+    0x0597,
+    0x0598,
+    0x0599,
+    0x059C,
+    0x059D,
+    0x059E,
+    0x059F,
+    0x05A0,
+    0x05A1,
+    0x05A8,
+    0x05A9,
+    0x05AB,
+    0x05AC,
+    0x05AF,
+    0x05C4,
+    0x0610,
+    0x0611,
+    0x0612,
+    0x0613,
+    0x0614,
+    0x0615,
+    0x0616,
+    0x0617,
+    0x0657,
+    0x0658,
+    0x0659,
+    0x065A,
+    0x065B,
+    0x065D,
+    0x065E,
+    0x06D6,
+    0x06D7,
+    0x06D8,
+    0x06D9,
+    0x06DA,
+    0x06DB,
+    0x06DC,
+    0x06DF,
+    0x06E0,
+    0x06E1,
+    0x06E2,
+    0x06E4,
+    0x06E7,
+    0x06E8,
+    0x06EB,
+    0x06EC,
+    0x0730,
+    0x0732,
+    0x0733,
+    0x0735,
+    0x0736,
+    0x073A,
+    0x073D,
+    0x073F,
+    0x0740,
+    0x0741,
+    0x0743,
+    0x0745,
+    0x0747,
+    0x0749,
+    0x074A,
+)
+_KITTY_DIACRITICS = tuple(chr(codepoint) for codepoint in _KITTY_DIACRITIC_CODEPOINTS)
+_KITTY_IMAGE_IDS = count(0xC0D300, 1)
+_CIRCLE_OFFSETS_BY_RADIUS: dict[int, tuple[tuple[int, int], ...]] = {}
 
 STATE_LOADING = "loading"
 STATE_AVAILABLE = "available"
@@ -112,6 +233,48 @@ class CodexProfileSnapshot:
     auth_reason: Optional[str] = None
 
 
+@dataclass
+class CodexPoolDrainSample:
+    captured_at: float
+    label: str
+    rate_percent_per_hour: float
+    total_drop_percent: float
+    dropping_accounts: int
+    compared_accounts: int
+    tracked_accounts: int
+    resetting_accounts: int
+    average_available_percent: float
+    total_available_percent: float
+    total_capacity_percent: float
+
+
+def _circle_offsets(radius: int) -> tuple[tuple[int, int], ...]:
+    cached = _CIRCLE_OFFSETS_BY_RADIUS.get(radius)
+    if cached is not None:
+        return cached
+    offsets: list[tuple[int, int]] = []
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dx * dx + dy * dy <= radius * radius:
+                offsets.append((dx, dy))
+    cached = tuple(offsets)
+    _CIRCLE_OFFSETS_BY_RADIUS[radius] = cached
+    return cached
+
+
+def _stdout_is_tty() -> bool:
+    for stream in (sys.__stdout__, sys.stdout):
+        isatty = getattr(stream, "isatty", None)
+        if not callable(isatty):
+            continue
+        try:
+            if isatty():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _safe_str(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
@@ -140,6 +303,32 @@ def _footer_line(message: str, *, width: int) -> str:
     if not message:
         return _clip(shortcuts, width)
     return _clip(f"{message}  |  {shortcuts}", width)
+
+
+def _truthy_env(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _kitty_graphics_requested(env: Optional[dict[str, str]] = None) -> bool:
+    env = env or os.environ
+    if _truthy_env(env.get("HERMES_AUTH_VIEW_DISABLE_KITTY_GRAPHICS")) or _truthy_env(
+        env.get("HERMES_AUTH_VIEW_DISABLE_KITTY_METER")
+    ):
+        return False
+    if _truthy_env(env.get("HERMES_AUTH_VIEW_FORCE_KITTY_GRAPHICS")) or _truthy_env(
+        env.get("HERMES_AUTH_VIEW_FORCE_KITTY_METER")
+    ):
+        return True
+    if not _stdout_is_tty():
+        return False
+    term = (env.get("TERM") or "").lower()
+    term_program = (env.get("TERM_PROGRAM") or "").lower()
+    kitty_window = (env.get("KITTY_WINDOW_ID") or "").strip()
+    return bool(term == "xterm-kitty" or term_program == "kitty" or kitty_window)
+
+
+def _kitty_meter_enabled_from_env(env: Optional[dict[str, str]] = None) -> bool:
+    return _kitty_graphics_requested(env)
 
 
 def _clamp_percent(value: Any) -> float:
@@ -183,6 +372,479 @@ def _window_available_percent(window: Optional[CodexUsageWindow]) -> Optional[fl
 
 def _window_is_exhausted(window: Optional[CodexUsageWindow]) -> bool:
     return bool(window and window.used_percent >= 99.5)
+
+
+def _collect_primary_window_state(
+    snapshots: list[CodexProfileSnapshot],
+) -> tuple[str, dict[str, tuple[float, Optional[int]]], int, float]:
+    label = "5h"
+    current_by_id: dict[str, tuple[float, Optional[int]]] = {}
+    tracked_accounts = 0
+    total_available_percent = 0.0
+    for snapshot in snapshots:
+        window = snapshot.primary_window
+        available = _window_available_percent(window)
+        if available is None:
+            continue
+        if window and window.label:
+            label = window.label
+        current_by_id[snapshot.entry_id] = (available, window.reset_at_ms if window else None)
+        tracked_accounts += 1
+        total_available_percent += available
+    return label, current_by_id, tracked_accounts, total_available_percent
+
+
+def _build_pool_drain_sample(
+    previous_by_id: dict[str, tuple[float, Optional[int]]],
+    current_snapshots: list[CodexProfileSnapshot],
+    *,
+    elapsed_seconds: float,
+    captured_at: Optional[float] = None,
+) -> Optional[CodexPoolDrainSample]:
+    label, current_by_id, tracked_accounts, total_available_percent = _collect_primary_window_state(current_snapshots)
+    if not current_by_id:
+        return None
+
+    compared_accounts = 0
+    dropping_accounts = 0
+    resetting_accounts = 0
+    total_drop_percent = 0.0
+    epsilon = 0.05
+
+    if elapsed_seconds > 0 and previous_by_id:
+        for entry_id, (current_available, current_reset_at_ms) in current_by_id.items():
+            previous = previous_by_id.get(entry_id)
+            if previous is None:
+                continue
+            previous_available, previous_reset_at_ms = previous
+            compared_accounts += 1
+            if (
+                current_reset_at_ms
+                and previous_reset_at_ms
+                and current_reset_at_ms != previous_reset_at_ms
+                and current_available > previous_available
+            ):
+                resetting_accounts += 1
+                continue
+            drop_percent = previous_available - current_available
+            if drop_percent > epsilon:
+                total_drop_percent += drop_percent
+                dropping_accounts += 1
+
+    rate_percent_per_hour = 0.0
+    if elapsed_seconds > 0:
+        rate_percent_per_hour = total_drop_percent / (elapsed_seconds / 3600.0)
+
+    average_available_percent = total_available_percent / tracked_accounts if tracked_accounts else 0.0
+    return CodexPoolDrainSample(
+        captured_at=float(captured_at if captured_at is not None else time.time()),
+        label=label,
+        rate_percent_per_hour=rate_percent_per_hour,
+        total_drop_percent=total_drop_percent,
+        dropping_accounts=dropping_accounts,
+        compared_accounts=compared_accounts,
+        tracked_accounts=tracked_accounts,
+        resetting_accounts=resetting_accounts,
+        average_available_percent=average_available_percent,
+        total_available_percent=total_available_percent,
+        total_capacity_percent=tracked_accounts * 100.0,
+    )
+
+
+def _meter_border_line(width: int, *, title: str = "", top: bool = True) -> str:
+    width = max(4, int(width))
+    inner = width - 2
+    if title:
+        decorated = _clip(f" {title} ", inner)
+        remaining = max(0, inner - len(decorated))
+        left = remaining // 2
+        right = remaining - left
+        fill = "─"
+        return f"{'╭' if top else '╰'}{fill * left}{decorated}{fill * right}{'╮' if top else '╯'}"
+    return f"{'╭' if top else '╰'}{'─' * inner}{'╮' if top else '╯'}"
+
+
+def _meter_text_line(width: int, text: str) -> str:
+    inner = max(2, int(width) - 2)
+    return f"│{_clip(text.ljust(inner), inner)}│"
+
+
+def _resample_series(values: list[float], width: int) -> list[float]:
+    width = max(1, int(width))
+    if not values:
+        return [0.0] * width
+    if len(values) == 1:
+        return [values[0]] * width
+    out: list[float] = []
+    last = len(values) - 1
+    for idx in range(width):
+        position = (idx / max(1, width - 1)) * last
+        left = int(position)
+        right = min(last, left + 1)
+        frac = position - left
+        out.append((values[left] * (1.0 - frac)) + (values[right] * frac))
+    return out
+
+
+def _render_pool_drain_meter(
+    samples: list[CodexPoolDrainSample],
+    *,
+    width: int,
+    height: int,
+    auto_refresh_seconds: float,
+) -> list[str]:
+    width = max(28, int(width))
+    height = max(6, int(height))
+    latest = samples[-1] if samples else None
+    label = latest.label if latest else "5h"
+    top = _meter_border_line(width, title=f"{label} pool burn meter", top=True)
+    bottom = _meter_border_line(width, title="rate history", top=False)
+    if latest is None:
+        stat1 = _meter_text_line(width, "warming up — waiting for two live polls")
+        stat2 = _meter_text_line(width, f"drain n/a  •  drop n/a  •  auto {int(auto_refresh_seconds)}s")
+        graph_height = max(1, height - 4)
+        graph_lines = [_meter_text_line(width, "·" * max(1, width - 6)) for _ in range(graph_height)]
+        return [top, stat1, stat2, *graph_lines[:graph_height], bottom][:height]
+
+    stat1 = _meter_text_line(
+        width,
+        f"drain {latest.rate_percent_per_hour:.1f} pool-%/h  •  drop {latest.dropping_accounts}/{latest.compared_accounts}",
+    )
+    stat2 = _meter_text_line(
+        width,
+        f"avg left {latest.average_available_percent:.0f}%  •  tracked {latest.tracked_accounts}  •  auto {int(auto_refresh_seconds)}s",
+    )
+
+    graph_height = max(1, height - 4)
+    graph_width = max(4, width - 2)
+    series = _resample_series([max(0.0, sample.rate_percent_per_hour) for sample in samples], graph_width)
+    peak = max(max(series, default=0.0), 1.0)
+    baseline_y = graph_height - 1
+    canvas = [[" " for _ in range(graph_width)] for _ in range(graph_height)]
+    for x in range(graph_width):
+        canvas[baseline_y][x] = "─"
+
+    previous_y: Optional[int] = None
+    previous_x: Optional[int] = None
+    for x, value in enumerate(series):
+        normalized = value / peak if peak > 0 else 0.0
+        y = baseline_y - int(round(normalized * max(1, graph_height - 1)))
+        y = max(0, min(baseline_y, y))
+        if previous_y is not None and previous_x is not None:
+            low = min(previous_y, y)
+            high = max(previous_y, y)
+            connector = "│"
+            if high - low == 1:
+                connector = "╱" if y < previous_y else "╲"
+                canvas[low][previous_x] = connector
+            else:
+                for mid in range(low + 1, high):
+                    canvas[mid][previous_x] = connector
+        if y < baseline_y and canvas[min(baseline_y, y + 1)][x] == " ":
+            canvas[min(baseline_y, y + 1)][x] = "·"
+        canvas[y][x] = "●" if x == graph_width - 1 else "•"
+        previous_y = y
+        previous_x = x
+
+    graph_lines = [_meter_text_line(width, "".join(row)) for row in canvas]
+    return [top, stat1, stat2, *graph_lines[:graph_height], bottom][:height]
+
+
+def _pool_drain_palette() -> tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]:
+    return (
+        (2, 9, 4),
+        (24, 126, 56),
+        (18, 90, 38),
+        (72, 255, 108),
+        (243, 255, 246),
+    )
+
+
+def _mix_color(
+    start: tuple[int, int, int],
+    end: tuple[int, int, int],
+    intensity: float,
+) -> tuple[int, int, int]:
+    intensity = max(0.0, min(1.0, intensity))
+    return (
+        round(start[0] + ((end[0] - start[0]) * intensity)),
+        round(start[1] + ((end[1] - start[1]) * intensity)),
+        round(start[2] + ((end[2] - start[2]) * intensity)),
+    )
+
+
+def _blend_pixel(
+    pixels: bytearray,
+    width_px: int,
+    height_px: int,
+    x: int,
+    y: int,
+    color: tuple[int, int, int, int],
+) -> None:
+    if x < 0 or y < 0 or x >= width_px or y >= height_px:
+        return
+    index = ((y * width_px) + x) * 4
+    src_r, src_g, src_b, src_a = color
+    if src_a <= 0:
+        return
+    if src_a >= 255:
+        pixels[index] = src_r
+        pixels[index + 1] = src_g
+        pixels[index + 2] = src_b
+        pixels[index + 3] = 255
+        return
+    dst_a = pixels[index + 3]
+    if dst_a >= 255:
+        inv_alpha = 255 - src_a
+        pixels[index] = ((src_r * src_a) + (pixels[index] * inv_alpha) + 127) // 255
+        pixels[index + 1] = ((src_g * src_a) + (pixels[index + 1] * inv_alpha) + 127) // 255
+        pixels[index + 2] = ((src_b * src_a) + (pixels[index + 2] * inv_alpha) + 127) // 255
+        pixels[index + 3] = 255
+        return
+    dst_r, dst_g, dst_b = pixels[index], pixels[index + 1], pixels[index + 2]
+    src_alpha = src_a / 255.0
+    dst_alpha = dst_a / 255.0
+    out_alpha = src_alpha + (dst_alpha * (1.0 - src_alpha))
+    if out_alpha <= 0:
+        return
+    pixels[index] = round(((src_r * src_alpha) + (dst_r * dst_alpha * (1.0 - src_alpha))) / out_alpha)
+    pixels[index + 1] = round(((src_g * src_alpha) + (dst_g * dst_alpha * (1.0 - src_alpha))) / out_alpha)
+    pixels[index + 2] = round(((src_b * src_alpha) + (dst_b * dst_alpha * (1.0 - src_alpha))) / out_alpha)
+    pixels[index + 3] = round(out_alpha * 255)
+
+
+def _stamp_pixel(
+    pixels: bytearray,
+    width_px: int,
+    height_px: int,
+    x: int,
+    y: int,
+    color: tuple[int, int, int, int],
+    *,
+    radius: int,
+) -> None:
+    for dx, dy in _circle_offsets(radius):
+        _blend_pixel(pixels, width_px, height_px, x + dx, y + dy, color)
+
+
+def _draw_polyline(
+    pixels: bytearray,
+    width_px: int,
+    height_px: int,
+    points: list[tuple[int, int]],
+    color: tuple[int, int, int, int],
+    *,
+    radius: int,
+) -> None:
+    if not points:
+        return
+    previous_x, previous_y = points[0]
+    _stamp_pixel(pixels, width_px, height_px, previous_x, previous_y, color, radius=radius)
+    for x, y in points[1:]:
+        steps = max(abs(x - previous_x), abs(y - previous_y), 1)
+        for step in range(steps + 1):
+            t = step / steps
+            draw_x = round(previous_x + ((x - previous_x) * t))
+            draw_y = round(previous_y + ((y - previous_y) * t))
+            _stamp_pixel(pixels, width_px, height_px, draw_x, draw_y, color, radius=radius)
+        previous_x, previous_y = x, y
+
+
+def _draw_horizontal_band(
+    pixels: bytearray,
+    width_px: int,
+    height_px: int,
+    y: int,
+    color: tuple[int, int, int, int],
+    *,
+    radius: int,
+) -> None:
+    if y < 0 or y >= height_px:
+        return
+    for band_y in range(max(0, y - radius), min(height_px, y + radius + 1)):
+        for x in range(width_px):
+            _blend_pixel(pixels, width_px, height_px, x, band_y, color)
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    payload = chunk_type + data
+    return struct.pack(">I", len(data)) + payload + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
+
+
+def _encode_png_rgba(width_px: int, height_px: int, pixels: bytearray) -> bytes:
+    stride = width_px * 4
+    raw = bytearray()
+    for row in range(height_px):
+        raw.append(0)
+        start = row * stride
+        raw.extend(pixels[start : start + stride])
+    compressed = zlib.compress(bytes(raw), level=9)
+    ihdr = struct.pack(">IIBBBBB", width_px, height_px, 8, 6, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", compressed) + _png_chunk(b"IEND", b"")
+
+
+def _fill_pool_drain_background(pixels: bytearray, width_px: int, height_px: int) -> None:
+    background, _border, _baseline, glow_color, _core = _pool_drain_palette()
+    center_y = (height_px - 1) / 2
+    row_stride = width_px * 4
+    for y in range(height_px):
+        distance = abs(y - center_y) / max(1.0, center_y)
+        haze = max(0.0, 1.0 - distance)
+        scanline = 0.92 if y % 2 else 1.0
+        red = round((background[0] + (glow_color[0] * 0.024 * haze)) * scanline)
+        green = round((background[1] + (glow_color[1] * 0.048 * haze)) * scanline)
+        blue = round((background[2] + (glow_color[2] * 0.02 * haze)) * scanline)
+        row = bytes((red, green, blue, 255)) * width_px
+        start = y * row_stride
+        pixels[start : start + row_stride] = row
+
+
+def _draw_pool_drain_border(pixels: bytearray, width_px: int, height_px: int) -> None:
+    _background, border, _baseline, glow_color, _core = _pool_drain_palette()
+    bright = (*_mix_color(border, glow_color, 0.28), 255)
+    halo = (*glow_color, 34)
+    inset = 1
+    for x in range(inset, width_px - inset):
+        _blend_pixel(pixels, width_px, height_px, x, inset, bright)
+        _blend_pixel(pixels, width_px, height_px, x, height_px - 1 - inset, bright)
+        if inset + 1 < height_px:
+            _blend_pixel(pixels, width_px, height_px, x, inset + 1, halo)
+            _blend_pixel(pixels, width_px, height_px, x, height_px - 2 - inset, halo)
+    for y in range(inset, height_px - inset):
+        _blend_pixel(pixels, width_px, height_px, inset, y, bright)
+        _blend_pixel(pixels, width_px, height_px, width_px - 1 - inset, y, bright)
+        if inset + 1 < width_px:
+            _blend_pixel(pixels, width_px, height_px, inset + 1, y, halo)
+            _blend_pixel(pixels, width_px, height_px, width_px - 2 - inset, y, halo)
+
+
+def _pool_drain_points(samples: list[CodexPoolDrainSample], *, width_px: int, height_px: int) -> list[tuple[int, int]]:
+    left = 8
+    right = max(left + 4, width_px - 9)
+    baseline_y = height_px // 2
+    max_amplitude = max(4, baseline_y - 8)
+    values = [max(0.0, sample.rate_percent_per_hour) for sample in samples] if samples else [0.0]
+    series = _resample_series(values, max(2, right - left + 1))
+    peak = max(max(series, default=0.0), 1.5)
+    points: list[tuple[int, int]] = []
+    for index, value in enumerate(series):
+        x = left + index
+        normalized = value / peak if peak > 0 else 0.0
+        y = baseline_y - int(round(normalized * max_amplitude))
+        points.append((x, max(6, min(height_px - 7, y))))
+    return points
+
+
+def _build_pool_drain_png_frame(
+    *,
+    samples: list[CodexPoolDrainSample],
+    width_px: int,
+    height_px: int,
+) -> bytes:
+    pixels = bytearray(width_px * height_px * 4)
+    _fill_pool_drain_background(pixels, width_px, height_px)
+    _draw_pool_drain_border(pixels, width_px, height_px)
+
+    _background, _border, baseline, glow_color, core = _pool_drain_palette()
+    baseline_y = height_px // 2
+    baseline_color = _mix_color(baseline, glow_color, 0.24)
+    baseline_core = _mix_color(glow_color, core, 0.12)
+    _draw_horizontal_band(pixels, width_px, height_px, baseline_y, (*glow_color, 18), radius=6)
+    _draw_horizontal_band(pixels, width_px, height_px, baseline_y, (*baseline_color, 46), radius=2)
+    _draw_horizontal_band(pixels, width_px, height_px, baseline_y, (*baseline_core, 112), radius=0)
+
+    points = _pool_drain_points(samples, width_px=width_px, height_px=height_px)
+    outer_glow = (*glow_color, 40)
+    mid_glow = (*glow_color, 96)
+    trace_color = (*_mix_color(glow_color, core, 0.42), 192)
+    core_color = (*core, 255)
+    _draw_polyline(pixels, width_px, height_px, points, outer_glow, radius=10)
+    _draw_polyline(pixels, width_px, height_px, points, mid_glow, radius=6)
+    _draw_polyline(pixels, width_px, height_px, points, trace_color, radius=3)
+    _draw_polyline(pixels, width_px, height_px, points, core_color, radius=1)
+    if points:
+        cursor_x, cursor_y = points[-1]
+        _stamp_pixel(pixels, width_px, height_px, cursor_x, cursor_y, (*core, 255), radius=2)
+
+    return _encode_png_rgba(width_px, height_px, pixels)
+
+
+def _build_kitty_placeholder_grid(*, image_id: int, columns: int, rows: int) -> list[str]:
+    if columns <= 0 or rows <= 0:
+        return []
+    if columns > len(_KITTY_DIACRITICS) or rows > len(_KITTY_DIACRITICS):
+        raise ValueError("kitty placeholder grid exceeds supported diacritic range")
+    return [
+        "".join(
+            f"{_KITTY_PLACEHOLDER}{_KITTY_DIACRITICS[row]}{_KITTY_DIACRITICS[column]}"
+            for column in range(columns)
+        )
+        for row in range(rows)
+    ]
+
+
+def _build_kitty_transmission(*, image_id: int, png_bytes: bytes, columns: int, rows: int) -> str:
+    encoded = base64.standard_b64encode(png_bytes).decode("ascii")
+    chunks = [encoded[index : index + _KITTY_CHUNK_SIZE] for index in range(0, len(encoded), _KITTY_CHUNK_SIZE)]
+    pieces: list[str] = []
+    last_index = len(chunks) - 1
+    for index, chunk in enumerate(chunks):
+        more = 0 if index == last_index else 1
+        if index == 0:
+            control = f"a=T,f=100,q=2,C=1,U=1,i={image_id},c={columns},r={rows},m={more}"
+        else:
+            control = f"m={more}"
+        pieces.append(f"\x1b_G{control};{chunk}\x1b\\")
+    return "".join(pieces)
+
+
+def _terminal_graphics_sequence(sequence: str) -> str:
+    if not os.environ.get("TMUX"):
+        return sequence
+    return f"\x1bPtmux;{sequence.replace(chr(27), chr(27) * 2)}\x1b\\"
+
+
+def _terminal_cell_pixels_from_fd(fd: int) -> tuple[int, int] | None:
+    try:
+        buffer = array.array("H", [0, 0, 0, 0])
+        fcntl.ioctl(fd, termios.TIOCGWINSZ, buffer, True)
+        rows, columns, width_px, height_px = buffer
+        if rows > 0 and columns > 0 and width_px > 0 and height_px > 0:
+            return (max(1, round(width_px / columns)), max(1, round(height_px / rows)))
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _terminal_cell_pixels() -> tuple[int, int]:
+    for stream in (sys.__stdout__, sys.stdout, sys.__stderr__, sys.stderr, sys.__stdin__, sys.stdin):
+        fileno = getattr(stream, "fileno", None)
+        if fileno is None:
+            continue
+        try:
+            fd = fileno()
+        except (OSError, ValueError):
+            continue
+        if not isinstance(fd, int) or fd < 0:
+            continue
+        size = _terminal_cell_pixels_from_fd(fd)
+        if size is not None:
+            return size
+    try:
+        with open("/dev/tty", "rb", buffering=0) as tty:
+            size = _terminal_cell_pixels_from_fd(tty.fileno())
+            if size is not None:
+                return size
+    except OSError:
+        pass
+    return _DEFAULT_CELL_PIXELS
+
+
+def _image_pixel_size(columns: int, rows: int) -> tuple[int, int]:
+    cell_width, cell_height = _terminal_cell_pixels()
+    width = max(220, min(1600, columns * max(4, round(cell_width * 1.0))))
+    height = max(96, min(540, rows * max(10, round(cell_height * 1.2))))
+    return width, height
 
 
 def _availability_metrics(snapshot: CodexProfileSnapshot) -> tuple[float, float]:
@@ -669,7 +1331,14 @@ def render_codex_auth_smoke_test(
 
 
 class CodexAuthTui:
-    def __init__(self, *, provider: str = DEFAULT_PROVIDER, timeout_seconds: float = 10.0):
+    def __init__(
+        self,
+        *,
+        provider: str = DEFAULT_PROVIDER,
+        timeout_seconds: float = 10.0,
+        kitty_meter: Optional[bool] = None,
+        auto_refresh_interval_seconds: float = AUTO_REFRESH_INTERVAL_SECONDS,
+    ):
         if provider != DEFAULT_PROVIDER:
             raise SystemExit(f"Auth view currently supports only {DEFAULT_PROVIDER}.")
         self.provider = provider
@@ -679,11 +1348,19 @@ class CodexAuthTui:
         self.selected_index = 0
         self.message = "Loading Codex profiles..."
         self.loading = False
+        self.kitty_meter_enabled = _kitty_meter_enabled_from_env() if kitty_meter is None else bool(kitty_meter)
+        self.auto_refresh_interval_seconds = max(0.0, float(auto_refresh_interval_seconds))
         self._lock = threading.Lock()
         self._refresh_generation = 0
         self._selected_entry_id: Optional[str] = None
         self._remove_confirm_entry_id: Optional[str] = None
         self._remove_confirm_deadline = 0.0
+        self._pool_drain_history: list[CodexPoolDrainSample] = []
+        self._last_primary_available: dict[str, tuple[float, Optional[int]]] = {}
+        self._last_primary_capture_at: Optional[float] = None
+        self._next_auto_refresh_at = 0.0
+        self._kitty_image_id = next(_KITTY_IMAGE_IDS) & 0xFFFFFF
+        self._last_kitty_graph_signature: Optional[tuple[Any, ...]] = None
 
     def _start_refresh(self, *, initial: bool = False, show_placeholders: bool = False) -> int:
         with self._lock:
@@ -743,6 +1420,9 @@ class CodexAuthTui:
         with self._lock:
             if generation != self._refresh_generation:
                 return
+            captured_at = time.time()
+            if snapshots:
+                self._record_pool_drain_sample_unlocked(snapshots, captured_at=captured_at)
             selected_id = self._selected_entry_id
             self.snapshots = self._apply_sort_mode(snapshots)
             if selected_id:
@@ -756,6 +1436,8 @@ class CodexAuthTui:
                 self.selected_index = min(self.selected_index, max(0, len(self.snapshots) - 1))
             self.loading = False
             self.message = message
+            if self.kitty_meter_enabled and self.auto_refresh_interval_seconds > 0:
+                self._next_auto_refresh_at = captured_at + self.auto_refresh_interval_seconds
             selected = self._selected_snapshot_unlocked()
             self._selected_entry_id = selected.entry_id if selected else None
 
@@ -847,6 +1529,101 @@ class CodexAuthTui:
             if self._remove_confirm_entry_id and time.time() > self._remove_confirm_deadline:
                 self._remove_confirm_entry_id = None
                 self._remove_confirm_deadline = 0.0
+
+    def _record_pool_drain_sample_unlocked(self, snapshots: list[CodexProfileSnapshot], *, captured_at: float) -> None:
+        elapsed_seconds = 0.0
+        if self._last_primary_capture_at is not None:
+            elapsed_seconds = max(0.0, captured_at - self._last_primary_capture_at)
+        sample = _build_pool_drain_sample(
+            self._last_primary_available,
+            snapshots,
+            elapsed_seconds=elapsed_seconds,
+            captured_at=captured_at,
+        )
+        _, current_by_id, _, _ = _collect_primary_window_state(snapshots)
+        if sample is not None:
+            self._pool_drain_history.append(sample)
+            if len(self._pool_drain_history) > MAX_POOL_DRAIN_SAMPLES:
+                self._pool_drain_history = self._pool_drain_history[-MAX_POOL_DRAIN_SAMPLES:]
+        self._last_primary_available = current_by_id
+        self._last_primary_capture_at = captured_at
+
+    def _graph_rows(self, width: int, height: int) -> int:
+        if not self.kitty_meter_enabled:
+            return 0
+        if width < KITTY_METER_MIN_WIDTH or height < KITTY_METER_MIN_HEIGHT:
+            return 0
+        return 8 if height < 32 else 10
+
+    def _graph_summary_lines(self, width: int) -> list[str]:
+        with self._lock:
+            latest = self._pool_drain_history[-1] if self._pool_drain_history else None
+        if latest is None:
+            return [
+                _clip("5h token burn monitor", width - 1),
+                _clip("warming up — waiting for two live polls", width - 1),
+            ]
+        return [
+            _clip(f"{latest.label} token burn monitor", width - 1),
+            _clip(
+                (
+                    f"drain {latest.rate_percent_per_hour:.1f} pool-%/h  •  drop {latest.dropping_accounts}/{latest.compared_accounts}  •  "
+                    f"avg left {latest.average_available_percent:.0f}%  •  auto {int(self.auto_refresh_interval_seconds)}s"
+                ),
+                width - 1,
+            ),
+        ]
+
+    def _graph_signature_unlocked(self, columns: int, rows: int) -> tuple[Any, ...]:
+        history = self._pool_drain_history[-24:]
+        return (
+            columns,
+            rows,
+            tuple((round(sample.captured_at, 3), round(sample.rate_percent_per_hour, 3)) for sample in history),
+        )
+
+    def _emit_kitty_graph(self, *, top_row: int, left_col: int, columns: int, rows: int) -> None:
+        if not self.kitty_meter_enabled or columns <= 0 or rows <= 0:
+            return
+        with self._lock:
+            history = list(self._pool_drain_history)
+            signature = self._graph_signature_unlocked(columns, rows)
+            needs_frame = signature != self._last_kitty_graph_signature
+            if needs_frame:
+                self._last_kitty_graph_signature = signature
+        out = sys.__stdout__ if getattr(sys, "__stdout__", None) is not None else sys.stdout
+        if out is None:
+            return
+        if needs_frame:
+            width_px, height_px = _image_pixel_size(columns, rows)
+            png_bytes = _build_pool_drain_png_frame(samples=history, width_px=width_px, height_px=height_px)
+            out.write(
+                _terminal_graphics_sequence(
+                    _build_kitty_transmission(
+                        image_id=self._kitty_image_id,
+                        png_bytes=png_bytes,
+                        columns=columns,
+                        rows=rows,
+                    )
+                )
+            )
+        red = (self._kitty_image_id >> 16) & 0xFF
+        green = (self._kitty_image_id >> 8) & 0xFF
+        blue = self._kitty_image_id & 0xFF
+        color_prefix = f"\x1b[38;2;{red};{green};{blue}m"
+        placeholder_lines = _build_kitty_placeholder_grid(image_id=self._kitty_image_id, columns=columns, rows=rows)
+        for row_offset, line in enumerate(placeholder_lines):
+            out.write(f"\x1b[{top_row + row_offset + 1};{left_col + 1}H{color_prefix}{line}\x1b[39m")
+        out.flush()
+
+    def _delete_kitty_graph_image(self) -> None:
+        if not self.kitty_meter_enabled:
+            return
+        out = sys.__stdout__ if getattr(sys, "__stdout__", None) is not None else sys.stdout
+        if out is None:
+            return
+        out.write(_terminal_graphics_sequence(f"\x1b_Ga=d,d=I,i={self._kitty_image_id}\x1b\\"))
+        out.flush()
 
     def _layout_sizes(self, width: int) -> tuple[int, int]:
         if width >= 120:
@@ -974,12 +1751,32 @@ class CodexAuthTui:
                     return
                 continue
 
+            trigger_auto_refresh = False
             with self._lock:
+                now = time.time()
+                if (
+                    self.kitty_meter_enabled
+                    and self.auto_refresh_interval_seconds > 0
+                    and not self.loading
+                    and self._next_auto_refresh_at > 0
+                    and now >= self._next_auto_refresh_at
+                ):
+                    self._next_auto_refresh_at = now + self.auto_refresh_interval_seconds
+                    trigger_auto_refresh = True
                 snapshots = list(self.snapshots)
                 selected_index = self.selected_index
                 loading = self.loading
                 message = self.message
                 sort_mode = self.sort_mode
+
+            if trigger_auto_refresh:
+                self._refresh_async()
+                with self._lock:
+                    snapshots = list(self.snapshots)
+                    selected_index = self.selected_index
+                    loading = self.loading
+                    message = self.message
+                    sort_mode = self.sort_mode
 
             counts = self._status_counts()
             short_label, long_label = self._label_pair()
@@ -995,6 +1792,20 @@ class CodexAuthTui:
                 header_attr |= curses.color_pair(4)
             stdscr.addnstr(0, 0, _clip(header, max_x - 1), max_x - 1, header_attr)
 
+            dim_attr = curses.color_pair(6) if curses.has_colors() else curses.A_DIM
+            graph_rows = self._graph_rows(max_x, max_y)
+            graph_summary_top = 1
+            graph_summary_lines = self._graph_summary_lines(max_x) if graph_rows else []
+            for line_offset, summary_line in enumerate(graph_summary_lines, start=graph_summary_top):
+                summary_attr = curses.A_BOLD if line_offset == graph_summary_top else curses.A_NORMAL
+                if curses.has_colors():
+                    summary_attr |= curses.color_pair(1 if line_offset > graph_summary_top else 4)
+                stdscr.addnstr(line_offset, 0, summary_line, max_x - 1, summary_attr)
+
+            graph_top = graph_summary_top + len(graph_summary_lines)
+            graph_left_col = 2
+            graph_columns = min(max(24, max_x - 4), len(_KITTY_DIACRITICS)) if graph_rows else 0
+            col_header_y = graph_top + graph_rows
             account_width, bar_width = self._layout_sizes(max_x)
             column_width = bar_width + 14
             week_heading = _clip(f" {long_label} left / back", column_width)
@@ -1003,10 +1814,9 @@ class CodexAuthTui:
                 f"  {'auth':<4} {'quota':<5} {'account':<{account_width}} {week_heading:<{column_width}} {hour_heading:<{column_width}}",
                 max_x - 1,
             )
-            dim_attr = curses.color_pair(6) if curses.has_colors() else curses.A_DIM
-            stdscr.addnstr(1, 0, col_header, max_x - 1, dim_attr)
+            stdscr.addnstr(col_header_y, 0, col_header, max_x - 1, dim_attr)
 
-            body_top = 2
+            body_top = col_header_y + 1
             body_bottom = max_y - 5
             visible_rows = max(1, body_bottom - body_top + 1)
             if selected_index < scroll_offset:
@@ -1046,6 +1856,13 @@ class CodexAuthTui:
 
             stdscr.addnstr(max_y - 1, 0, _footer_line(message, width=max_x - 1), max_x - 1, dim_attr)
             stdscr.refresh()
+            if graph_rows and graph_columns:
+                self._emit_kitty_graph(
+                    top_row=graph_top,
+                    left_col=graph_left_col,
+                    columns=graph_columns,
+                    rows=graph_rows,
+                )
 
             key = stdscr.getch()
             if key == -1:
@@ -1083,7 +1900,10 @@ class CodexAuthTui:
     def run(self) -> None:
         import curses
 
-        curses.wrapper(self._run_curses)
+        try:
+            curses.wrapper(self._run_curses)
+        finally:
+            self._delete_kitty_graph_image()
 
 
 def auth_view_command(args) -> None:
