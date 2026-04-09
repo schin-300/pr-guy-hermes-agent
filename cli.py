@@ -1797,6 +1797,9 @@ class HermesCLI:
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
+        self._busy_command_queue = queue.Queue()
+        self._tool_boundary_input_queue = queue.Queue()
+        self._active_agent_thread = None
         self._should_exit = False
         self._last_ctrl_c_time = 0
         self._clarify_state = None
@@ -2093,6 +2096,203 @@ class HermesCLI:
         if not isinstance(items, list):
             return []
         return [item for item in items if isinstance(item, dict)]
+
+    def _busy_command_behavior(self, command: str) -> str:
+        """Return how a slash command should behave while the agent is busy."""
+        text = str(command or "").strip()
+        if not text or not _looks_like_slash_command(text):
+            return "defer"
+
+        from hermes_cli.commands import COMMANDS as _COMMANDS, resolve_command as _resolve_cmd
+
+        cmd_lower = text.lower()
+        typed_token = cmd_lower.split()[0]
+        base_word = typed_token.lstrip("/")
+
+        quick_commands = getattr(self, "config", {}) or {}
+        quick_map = quick_commands.get("quick_commands", {}) if isinstance(quick_commands, dict) else {}
+        if isinstance(quick_map, dict) and base_word in quick_map:
+            return "defer"
+        if base_word in _get_plugin_cmd_handler_names():
+            return "defer"
+        if typed_token in _skill_commands:
+            return "defer"
+
+        cmd_def = _resolve_cmd(base_word)
+        if cmd_def is None:
+            all_known = set(_COMMANDS) | set(_skill_commands)
+            matches = [candidate for candidate in all_known if candidate.startswith(typed_token)]
+            if len(matches) > 1:
+                exact = [candidate for candidate in matches if candidate == typed_token]
+                if len(exact) == 1:
+                    matches = exact
+                else:
+                    min_len = min(len(candidate) for candidate in matches)
+                    shortest = [candidate for candidate in matches if len(candidate) == min_len]
+                    if len(shortest) == 1:
+                        matches = shortest
+            if len(matches) == 1:
+                chosen = matches[0]
+                if chosen in _skill_commands:
+                    return "defer"
+                cmd_def = _resolve_cmd(chosen.lstrip("/"))
+        if cmd_def is None:
+            return "defer"
+
+        behavior = getattr(cmd_def, "busy_behavior", "defer") or "defer"
+        if behavior != "dynamic":
+            return behavior
+
+        canonical = cmd_def.name
+        parts = text.split(maxsplit=1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+        if canonical == "reasoning":
+            return "live" if arg in {"", "show", "hide", "on", "off"} else "defer"
+        return "defer"
+
+    @staticmethod
+    def _preview_queued_payload(payload, *, limit: int = 80) -> str:
+        text = payload if isinstance(payload, str) else ""
+        images = []
+        if isinstance(payload, tuple):
+            text = payload[0] if payload else ""
+            if len(payload) > 1 and payload[1]:
+                images = list(payload[1])
+        preview = text if text else f"[{len(images)} image{'s' if len(images) != 1 else ''} attached]"
+        return preview[:limit] + ('...' if len(preview) > limit else '')
+
+    def _ensure_tool_boundary_input_queue(self):
+        boundary_queue = getattr(self, '_tool_boundary_input_queue', None)
+        if boundary_queue is None:
+            boundary_queue = queue.Queue()
+            self._tool_boundary_input_queue = boundary_queue
+        return boundary_queue
+
+    def _queue_after_current_tool_boundary(self, payload) -> int:
+        boundary_queue = self._ensure_tool_boundary_input_queue()
+        boundary_queue.put(payload)
+        try:
+            return boundary_queue.qsize()
+        except Exception:
+            return 0
+
+    def _flush_tool_boundary_queue_to_pending(self) -> list[Any]:
+        boundary_queue = getattr(self, '_tool_boundary_input_queue', None)
+        pending_queue = getattr(self, '_pending_input', None)
+        if boundary_queue is None or pending_queue is None:
+            return []
+
+        flushed: list[Any] = []
+        while True:
+            try:
+                payload = boundary_queue.get_nowait()
+            except queue.Empty:
+                break
+            if not payload:
+                continue
+            pending_queue.put(payload)
+            flushed.append(payload)
+        return flushed
+
+    def _promote_tool_boundary_input_to_interrupt(self) -> bool:
+        boundary_queue = getattr(self, '_tool_boundary_input_queue', None)
+        agent = getattr(self, 'agent', None)
+        if boundary_queue is None or agent is None or not getattr(self, '_agent_running', False):
+            return False
+        if getattr(agent, '_interrupt_requested', False):
+            return False
+
+        try:
+            payload = boundary_queue.get_nowait()
+        except queue.Empty:
+            return False
+        if not payload:
+            return False
+
+        try:
+            agent.interrupt(payload)
+            return True
+        except Exception:
+            logger.debug("Failed to promote queued follow-up to interrupt", exc_info=True)
+            pending_queue = getattr(self, '_pending_input', None)
+            if pending_queue is not None:
+                pending_queue.put(payload)
+            return False
+
+    def _agent_busy_placeholder_text(self) -> str:
+        if getattr(self, 'busy_input_mode', 'interrupt') == 'queue':
+            return "type a message + Enter to queue next turn, /q after tool, Ctrl+C to cancel"
+        return "type a message + Enter to interrupt, /q to queue message, Ctrl+C to cancel"
+
+    def _submit_busy_input(self, payload) -> str:
+        """Route user input submitted while the agent is already generating."""
+        text = payload if isinstance(payload, str) else ""
+        images = []
+        if isinstance(payload, tuple):
+            text = payload[0] if payload else ""
+            if len(payload) > 1 and payload[1]:
+                images = list(payload[1])
+
+        preview_short = self._preview_queued_payload(payload)
+
+        if text and _looks_like_slash_command(text):
+            behavior = self._busy_command_behavior(text)
+            active_thread = getattr(self, '_active_agent_thread', None)
+            thread_alive = bool(active_thread and active_thread.is_alive())
+            if behavior == "live" and not images and thread_alive:
+                if not hasattr(self, '_busy_command_queue') or self._busy_command_queue is None:
+                    self._busy_command_queue = queue.Queue()
+                self._busy_command_queue.put(text)
+                _cprint(f"  Running while busy: {preview_short}")
+                return "live"
+
+            self._pending_input.put(payload)
+            _cprint(f"  Queued command for after current turn: {preview_short}")
+            return "defer"
+
+        if self.busy_input_mode == "queue":
+            self._pending_input.put(payload)
+            _cprint(f"  Queued for the next turn: {preview_short}")
+            return "queue"
+
+        self._interrupt_queue.put(payload)
+        # Debug: log to file when message enters interrupt queue
+        try:
+            _dbg = _hermes_home / "interrupt_debug.log"
+            with open(_dbg, "a") as _f:
+                import time as _t
+                _f.write(f"{_t.strftime('%H:%M:%S')} ENTER: queued interrupt msg={str(payload)[:60]!r}, "
+                         f"agent_running={self._agent_running}\n")
+        except Exception:
+            pass
+        return "interrupt"
+
+    def _process_live_busy_commands(self, *, max_commands: Optional[int] = 8) -> None:
+        """Run any live-safe slash commands queued while the agent is busy."""
+        command_queue = getattr(self, '_busy_command_queue', None)
+        if command_queue is None:
+            return
+
+        processed = 0
+        while (max_commands is None or processed < max_commands) and not getattr(self, '_should_exit', False):
+            try:
+                command = command_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if not command:
+                continue
+
+            processed += 1
+            try:
+                should_continue = self.process_command(command)
+            except Exception as e:
+                logger.exception("Live busy command failed: %s", command)
+                _cprint(f"  Live command failed while busy: {e}")
+                should_continue = True
+            if not should_continue:
+                self._should_exit = True
+                break
 
     def _todo_plan_recently_updated(self, now: Optional[float] = None) -> bool:
         updated_at = float(getattr(self, "_todo_plan_updated_at", 0.0) or 0.0)
@@ -6017,11 +6217,24 @@ class HermesCLI:
             if not payload:
                 _cprint("  Usage: /queue <prompt>")
             else:
-                self._pending_input.put(payload)
+                preview = self._preview_queued_payload(payload)
                 if self._agent_running:
-                    _cprint(f"  Queued for the next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
+                    self._queue_after_current_tool_boundary(payload)
+                    agent = getattr(self, "agent", None)
+                    tool_active = bool(
+                        agent
+                        and (
+                            getattr(agent, "_executing_tools", False)
+                            or getattr(agent, "_current_tool", None)
+                        )
+                    )
+                    if tool_active:
+                        _cprint(f"  Queued after the current tool call: {preview}")
+                    else:
+                        _cprint(f"  Queued for the next safe boundary: {preview}")
                 else:
-                    _cprint(f"  Queued: {payload[:80]}{'...' if len(payload) > 80 else ''}")
+                    self._pending_input.put(payload)
+                    _cprint(f"  Queued: {preview}")
         elif canonical == "skin":
             self._handle_skin_command(cmd_original)
         elif canonical == "voice":
@@ -7264,6 +7477,8 @@ class HermesCLI:
                 logger.debug("Todo plan widget update failed", exc_info=True)
             self._invalidate(min_interval=0)
 
+        self._promote_tool_boundary_input_to_interrupt()
+
     # ====================================================================
     # Voice mode methods
     # ====================================================================
@@ -8182,6 +8397,7 @@ class HermesCLI:
 
             # Start agent in background thread
             agent_thread = threading.Thread(target=run_agent)
+            self._active_agent_thread = agent_thread
             agent_thread.start()
 
             # Monitor the dedicated interrupt queue while the agent runs.
@@ -8192,6 +8408,7 @@ class HermesCLI:
             # so we skip interrupt processing to avoid stealing that input.
             interrupt_msg = None
             while agent_thread.is_alive():
+                self._process_live_busy_commands()
                 if hasattr(self, '_interrupt_queue'):
                     try:
                         interrupt_msg = self._interrupt_queue.get(timeout=0.1)
@@ -8231,6 +8448,8 @@ class HermesCLI:
                     agent_thread.join(0.1)
 
             agent_thread.join()  # Ensure agent thread completes
+            self._active_agent_thread = None
+            self._process_live_busy_commands(max_commands=None)
 
             # Proactively clean up async clients whose event loop is dead.
             # The agent thread may have created AsyncOpenAI clients bound
@@ -8399,13 +8618,17 @@ class HermesCLI:
                 else:
                     print(f"\n⚡ Sending after interrupt: '{preview}'")
                 self._pending_input.put(combined)
-            
+
+            self._flush_tool_boundary_queue_to_pending()
+
             return response
             
         except Exception as e:
             print(f"Error: {e}")
             return None
         finally:
+            self._active_agent_thread = None
+            self._flush_tool_boundary_queue_to_pending()
             # Ensure streaming TTS resources are cleaned up even on error.
             # Normal path sends the sentinel at line ~3568; this is a safety
             # net for exception paths that skip it.  Duplicate sentinels are
@@ -8688,8 +8911,11 @@ class HermesCLI:
         
         # State for async operation
         self._agent_running = False
-        self._pending_input = queue.Queue()     # For normal input (commands + new queries)
-        self._interrupt_queue = queue.Queue()   # For messages typed while agent is running
+        self._pending_input = queue.Queue()      # For normal input (commands + new queries)
+        self._interrupt_queue = queue.Queue()    # For messages typed while agent is running
+        self._busy_command_queue = queue.Queue() # For live-safe slash commands typed while agent is running
+        self._tool_boundary_input_queue = queue.Queue()
+        self._active_agent_thread = None         # The currently-running agent worker thread for busy-command routing
         self._should_exit = False
         self._last_ctrl_c_time = 0  # Track double Ctrl+C for force exit
 
@@ -8777,10 +9003,11 @@ class HermesCLI:
             - Approval selection: selected choice goes to approval response queue
             - Clarify freetext mode: answer goes to the clarify response queue
             - Clarify choice mode: selected choice goes to the clarify response queue
-            - Agent running: goes to _interrupt_queue (chat() monitors this)
+            - Agent running: busy-safe slash commands may run live; other input
+              follows the busy routing queues monitored by chat()
             - Agent idle: goes to _pending_input (process_loop monitors this)
-            Commands (starting with /) always go to _pending_input so they're
-            handled as commands, not sent as interrupt text to the agent.
+            Busy-safe slash commands can execute immediately while the agent is
+            generating; other slash commands defer until the turn ends.
             """
             # --- Sudo password prompt: submit the typed password ---
             if self._sudo_state:
@@ -8848,23 +9075,8 @@ class HermesCLI:
                 event.app.invalidate()
                 # Bundle text + images as a tuple when images are present
                 payload = (text, images) if images else text
-                if self._agent_running and not (text and _looks_like_slash_command(text)):
-                    if self.busy_input_mode == "queue":
-                        # Queue for the next turn instead of interrupting
-                        self._pending_input.put(payload)
-                        preview = text if text else f"[{len(images)} image{'s' if len(images) != 1 else ''} attached]"
-                        _cprint(f"  Queued for the next turn: {preview[:80]}{'...' if len(preview) > 80 else ''}")
-                    else:
-                        self._interrupt_queue.put(payload)
-                        # Debug: log to file when message enters interrupt queue
-                        try:
-                            _dbg = _hermes_home / "interrupt_debug.log"
-                            with open(_dbg, "a") as _f:
-                                import time as _t
-                                _f.write(f"{_t.strftime('%H:%M:%S')} ENTER: queued interrupt msg={str(payload)[:60]!r}, "
-                                         f"agent_running={self._agent_running}\n")
-                        except Exception:
-                            pass
+                if self._agent_running:
+                    self._submit_busy_input(payload)
                 else:
                     self._pending_input.put(payload)
                 event.app.current_buffer.reset(append_to_history=True)
@@ -9420,7 +9632,7 @@ class HermesCLI:
                 status = cli_ref._command_status or "Processing command..."
                 return f"{frame} {status}"
             if cli_ref._agent_running:
-                return "type a message + Enter to interrupt, Ctrl+C to cancel"
+                return cli_ref._agent_busy_placeholder_text()
             if cli_ref._voice_mode:
                 return "type or Ctrl+B to record"
             return ""

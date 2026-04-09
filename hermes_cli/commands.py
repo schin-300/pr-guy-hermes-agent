@@ -47,6 +47,7 @@ class CommandDef:
     cli_only: bool = False             # only available in CLI
     gateway_only: bool = False         # only available in gateway/messaging
     gateway_config_gate: str | None = None  # config dotpath; when truthy, overrides cli_only for gateway
+    busy_behavior: str = "defer"      # CLI while-agent-busy behavior: defer | live | dynamic
 
 
 # ---------------------------------------------------------------------------
@@ -81,8 +82,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("bg",), args_hint="<prompt>"),
     CommandDef("btw", "Ephemeral side question using session context (no tools, not persisted)", "Session",
                args_hint="<question>"),
-    CommandDef("queue", "Queue a prompt for the next turn (doesn't interrupt)", "Session",
-               aliases=("q",), args_hint="<prompt>"),
+    CommandDef("queue", "Queue a prompt for the next safe boundary (usually after the current tool call)", "Session",
+               aliases=("q",), args_hint="<prompt>", busy_behavior="live"),
     CommandDef("status", "Show session info", "Session"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
@@ -98,24 +99,26 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="[tokens]"),
     CommandDef("provider", "Show available providers and current provider",
                "Configuration"),
-
+    CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
+               args_hint="[normal|fast|status]",
+               subcommands=("normal", "fast", "status", "on", "off"),
+               busy_behavior="live"),
     CommandDef("personality", "Set a predefined personality", "Configuration",
                args_hint="[name]"),
     CommandDef("statusbar", "Toggle the context/model status bar", "Configuration",
-               cli_only=True, aliases=("sb",)),
+               cli_only=True, aliases=("sb",), busy_behavior="live"),
     CommandDef("verbose", "Cycle tool progress display: off -> new -> all -> verbose",
                "Configuration", cli_only=True,
-               gateway_config_gate="display.tool_progress_command"),
+               gateway_config_gate="display.tool_progress_command",
+               busy_behavior="live"),
     CommandDef("yolo", "Toggle YOLO mode (skip all dangerous command approvals)",
                "Configuration"),
     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
                args_hint="[level|show|hide]",
-               subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "show", "hide", "on", "off")),
-    CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
-               args_hint="[normal|fast|status]",
-               subcommands=("normal", "fast", "status", "on", "off")),
+               subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "show", "hide", "on", "off"),
+               busy_behavior="dynamic"),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
-               cli_only=True, args_hint="[name]"),
+               cli_only=True, args_hint="[name]", busy_behavior="live"),
     CommandDef("voice", "Toggle voice mode", "Configuration",
                args_hint="[on|off|tts|status]", subcommands=("on", "off", "tts", "status")),
 

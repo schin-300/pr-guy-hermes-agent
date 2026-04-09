@@ -230,6 +230,8 @@ display:
 
 Queue mode is useful when you want to prepare follow-up messages without accidentally canceling in-flight work. Unknown values fall back to `"interrupt"`.
 
+A small live-safe subset of CLI slash commands now bypasses that queue while the agent is generating and applies immediately instead: `/queue`, `/fast`, `/verbose`, `/statusbar`, `/skin`, and `/reasoning` display toggles (`show`, `hide`, `on`, `off`, or bare `/reasoning` to inspect the current state). Stateful or disruptive commands such as `/model`, `/new`, `/undo`, and `/retry` still wait for the current turn to finish.
+
 ### Suspending to Background
 
 On Unix systems, press **`Ctrl+Z`** to suspend Hermes to the background — just like any terminal process. The shell prints a confirmation:
