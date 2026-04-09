@@ -74,6 +74,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<prompt>"),
     CommandDef("hermes-addition", "Spawn a background worktree agent that prepares a PR on your fork", "Session",
                cli_only=True, args_hint="<prompt>"),
+    CommandDef("fix-a-fork", "Spawn a background agent on an experimental Hermes-fork branch with separate commit/push/PR approvals", "Session",
+               cli_only=True, args_hint="<prompt>"),
     CommandDef("compress", "Manually compress conversation context", "Session"),
     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
                args_hint="[number]"),
