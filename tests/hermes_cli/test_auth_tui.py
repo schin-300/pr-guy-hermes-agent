@@ -202,6 +202,47 @@ def test_build_codex_profile_snapshots_polls_in_parallel(monkeypatch):
     assert len(thread_ids) >= 2
 
 
+def test_build_codex_profile_snapshots_can_filter_entry_ids(monkeypatch):
+    entries = [
+        PooledCredential(
+            provider="openai-codex",
+            id=f"cred-{idx}",
+            label=f"user{idx}@example.com",
+            auth_type="oauth",
+            priority=idx,
+            source="manual:device_code",
+            access_token=f"token-{idx}",
+            refresh_token=f"refresh-{idx}",
+        )
+        for idx in range(3)
+    ]
+    pool = _FakePool(entries)
+    monkeypatch.setattr("hermes_cli.auth_tui.load_pool", lambda provider: pool)
+
+    seen_ids = []
+
+    def _fake_fetch(pool_obj, entry, timeout_seconds):
+        seen_ids.append(entry.id)
+        return entry, CodexLiveStatus(
+            http_status=200,
+            email=entry.label,
+            allowed=True,
+            limit_reached=False,
+            primary_window=CodexUsageWindow(label="5h", used_percent=10),
+            secondary_window=CodexUsageWindow(label="Week", used_percent=10),
+        )
+
+    snapshots = build_codex_profile_snapshots(
+        provider="openai-codex",
+        timeout_seconds=7.5,
+        fetch_profile=_fake_fetch,
+        entry_ids={"cred-1"},
+    )
+
+    assert [snapshot.entry_id for snapshot in snapshots] == ["cred-1"]
+    assert seen_ids == ["cred-1"]
+
+
 def test_build_codex_profile_snapshots_sorts_by_availability(monkeypatch):
     entries = [
         PooledCredential(
@@ -620,6 +661,20 @@ def test_cycle_auto_refresh_interval_rotates_live_presets(monkeypatch):
     assert "Auto refresh" in tui.message
 
 
+def test_auto_refresh_scope_uses_available_polling_but_forces_periodic_full_scans():
+    tui = CodexAuthTui(provider="openai-codex", timeout_seconds=3.0, kitty_meter=True, auto_refresh_interval_seconds=15.0)
+    tui.loading = False
+    tui._next_auto_refresh_at = 110.0
+    tui._next_full_refresh_at = 160.0
+
+    assert tui._auto_refresh_scope_at(109.0) is None
+    assert tui._auto_refresh_scope_at(120.0) == "available"
+    assert tui._auto_refresh_scope_at(160.0) == "all"
+
+    tui.auto_refresh_interval_seconds = 0.0
+    assert tui._auto_refresh_scope_at(170.0) == "all"
+
+
 def test_refresh_blocking_fetches_live_before_showing_rows(monkeypatch):
     tui = CodexAuthTui(provider="openai-codex", timeout_seconds=3.0)
     snapshots = [
@@ -651,6 +706,67 @@ def test_refresh_blocking_fetches_live_before_showing_rows(monkeypatch):
     assert tui.loading is False
     assert tui.snapshots == snapshots
     assert tui.message == "Loaded 1 live Codex profile."
+
+
+def test_fetch_live_snapshots_available_scope_polls_only_available_accounts(monkeypatch):
+    tui = CodexAuthTui(provider="openai-codex", timeout_seconds=3.0)
+    tui.snapshots = [
+        CodexProfileSnapshot(
+            index=1,
+            entry_id="avail-1",
+            label="avail-1@example.com",
+            display_name="avail-1@example.com",
+            auth_badge="OK",
+            state=STATE_AVAILABLE,
+            state_badge="AVAIL",
+            state_reason="Available",
+            primary_window=CodexUsageWindow(label="5h", used_percent=20),
+            secondary_window=CodexUsageWindow(label="Week", used_percent=10),
+        ),
+        CodexProfileSnapshot(
+            index=2,
+            entry_id="limit-1",
+            label="limit-1@example.com",
+            display_name="limit-1@example.com",
+            auth_badge="OK",
+            state=STATE_LIMITED,
+            state_badge="LIMIT",
+            state_reason="5h limit reached",
+            primary_window=CodexUsageWindow(label="5h", used_percent=100),
+            secondary_window=CodexUsageWindow(label="Week", used_percent=10),
+        ),
+    ]
+
+    captured_entry_ids = []
+
+    def _fake_build(*, provider, timeout_seconds, entry_ids, fetch_profile=None):
+        captured_entry_ids.append(set(entry_ids))
+        return [
+            CodexProfileSnapshot(
+                index=1,
+                entry_id="avail-1",
+                label="avail-1@example.com",
+                display_name="avail-1@example.com",
+                auth_badge="OK",
+                state=STATE_AVAILABLE,
+                state_badge="AVAIL",
+                state_reason="Available",
+                primary_window=CodexUsageWindow(label="5h", used_percent=35),
+                secondary_window=CodexUsageWindow(label="Week", used_percent=12),
+            )
+        ]
+
+    monkeypatch.setattr("hermes_cli.auth_tui.build_codex_profile_snapshots", _fake_build)
+
+    snapshots, message, refresh_scope = tui._fetch_live_snapshots(refresh_scope="available")
+
+    assert captured_entry_ids == [{"avail-1"}]
+    assert refresh_scope == "available"
+    assert {snapshot.entry_id for snapshot in snapshots} == {"avail-1", "limit-1"}
+    merged = {snapshot.entry_id: snapshot for snapshot in snapshots}
+    assert merged["avail-1"].primary_window.used_percent == 35
+    assert merged["limit-1"].state == STATE_LIMITED
+    assert "available" in message.lower()
 
 
 def test_set_sort_mode_reorders_rows_and_preserves_selection():
