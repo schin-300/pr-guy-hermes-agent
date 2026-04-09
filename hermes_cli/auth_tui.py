@@ -51,6 +51,7 @@ AUTO_REFRESH_INTERVAL_SECONDS = 30.0
 KITTY_METER_MIN_WIDTH = 96
 KITTY_METER_MIN_HEIGHT = 20
 MAX_POOL_DRAIN_SAMPLES = 64
+MAX_VISIBLE_POOL_DRAIN_POLLS = 30
 _KITTY_PLACEHOLDER = "\U0010EEEE"
 _KITTY_CHUNK_SIZE = 4096
 _DEFAULT_CELL_PIXELS = (10, 20)
@@ -486,6 +487,76 @@ def _resample_series(values: list[float], width: int) -> list[float]:
     return out
 
 
+def _format_poll_interval_seconds(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds <= 0.0:
+        return "off"
+    rounded = round(seconds)
+    if math.isclose(seconds, rounded, abs_tol=1e-6):
+        return f"{int(rounded)}s"
+    return f"{seconds:.1f}".rstrip("0").rstrip(".") + "s"
+
+
+def _pool_drain_plot_points_from_values(
+    values: list[float],
+    *,
+    left: int,
+    right: int,
+    baseline_y: int,
+    max_amplitude: int,
+    min_y: int,
+    max_y: int,
+    max_visible_polls: int = MAX_VISIBLE_POOL_DRAIN_POLLS,
+) -> list[tuple[int, int]]:
+    visible = list(values[-max(1, int(max_visible_polls)) :]) if values else [0.0]
+    slot_count = max(2, int(max_visible_polls))
+    if len(visible) == 1:
+        x_positions = [right]
+    else:
+        start_slot = max(0, slot_count - len(visible))
+        x_span = max(0, right - left)
+        x_positions = [
+            left + round((x_span * (start_slot + index)) / max(1, slot_count - 1))
+            for index in range(len(visible))
+        ]
+    peak = max(max(visible, default=0.0), 1.5)
+    points: list[tuple[int, int]] = []
+    for x, value in zip(x_positions, visible):
+        normalized = value / peak if peak > 0 else 0.0
+        y = baseline_y - int(round(normalized * max_amplitude))
+        points.append((x, max(min_y, min(max_y, y))))
+    return points
+
+
+def _draw_text_graph_segment(
+    canvas: list[list[str]],
+    start: tuple[int, int],
+    end: tuple[int, int],
+    *,
+    endpoint_char: str,
+) -> None:
+    x0, y0 = start
+    x1, y1 = end
+    steps = max(abs(x1 - x0), abs(y1 - y0), 1)
+    diagonal = "╱" if y1 < y0 else "╲"
+    for step in range(steps + 1):
+        x = round(x0 + ((x1 - x0) * (step / steps)))
+        y = round(y0 + ((y1 - y0) * (step / steps)))
+        if y < 0 or y >= len(canvas) or x < 0 or x >= len(canvas[y]):
+            continue
+        if step == steps:
+            canvas[y][x] = endpoint_char
+        elif step == 0:
+            canvas[y][x] = "•"
+        elif y0 == y1:
+            canvas[y][x] = "─"
+        elif x0 == x1:
+            canvas[y][x] = "│"
+        else:
+            canvas[y][x] = diagonal
+
+
+
 def _render_pool_drain_meter(
     samples: list[CodexPoolDrainSample],
     *,
@@ -497,11 +568,13 @@ def _render_pool_drain_meter(
     height = max(6, int(height))
     latest = samples[-1] if samples else None
     label = latest.label if latest else "5h"
+    poll_interval_text = _format_poll_interval_seconds(auto_refresh_seconds)
+    visible_polls = min(MAX_VISIBLE_POOL_DRAIN_POLLS, len(samples))
     top = _meter_border_line(width, title=f"{label} pool burn meter", top=True)
     bottom = _meter_border_line(width, title="rate history", top=False)
     if latest is None:
         stat1 = _meter_text_line(width, "warming up — waiting for two live polls")
-        stat2 = _meter_text_line(width, f"drain n/a  •  drop n/a  •  auto {int(auto_refresh_seconds)}s")
+        stat2 = _meter_text_line(width, f"drain n/a  •  drop n/a  •  auto {poll_interval_text}")
         graph_height = max(1, height - 4)
         graph_lines = [_meter_text_line(width, "·" * max(1, width - 6)) for _ in range(graph_height)]
         return [top, stat1, stat2, *graph_lines[:graph_height], bottom][:height]
@@ -512,39 +585,37 @@ def _render_pool_drain_meter(
     )
     stat2 = _meter_text_line(
         width,
-        f"avg left {latest.average_available_percent:.0f}%  •  tracked {latest.tracked_accounts}  •  auto {int(auto_refresh_seconds)}s",
+        f"avg left {latest.average_available_percent:.0f}%  •  {visible_polls}/{MAX_VISIBLE_POOL_DRAIN_POLLS} polls  •  auto {poll_interval_text}",
     )
 
     graph_height = max(1, height - 4)
     graph_width = max(4, width - 2)
-    series = _resample_series([max(0.0, sample.rate_percent_per_hour) for sample in samples], graph_width)
-    peak = max(max(series, default=0.0), 1.0)
     baseline_y = graph_height - 1
     canvas = [[" " for _ in range(graph_width)] for _ in range(graph_height)]
     for x in range(graph_width):
         canvas[baseline_y][x] = "─"
 
-    previous_y: Optional[int] = None
-    previous_x: Optional[int] = None
-    for x, value in enumerate(series):
-        normalized = value / peak if peak > 0 else 0.0
-        y = baseline_y - int(round(normalized * max(1, graph_height - 1)))
-        y = max(0, min(baseline_y, y))
-        if previous_y is not None and previous_x is not None:
-            low = min(previous_y, y)
-            high = max(previous_y, y)
-            connector = "│"
-            if high - low == 1:
-                connector = "╱" if y < previous_y else "╲"
-                canvas[low][previous_x] = connector
-            else:
-                for mid in range(low + 1, high):
-                    canvas[mid][previous_x] = connector
-        if y < baseline_y and canvas[min(baseline_y, y + 1)][x] == " ":
-            canvas[min(baseline_y, y + 1)][x] = "·"
-        canvas[y][x] = "●" if x == graph_width - 1 else "•"
-        previous_y = y
-        previous_x = x
+    values = [max(0.0, sample.rate_percent_per_hour) for sample in samples]
+    points = _pool_drain_plot_points_from_values(
+        values,
+        left=0,
+        right=max(0, graph_width - 1),
+        baseline_y=baseline_y,
+        max_amplitude=max(1, graph_height - 1),
+        min_y=0,
+        max_y=baseline_y,
+    )
+    if len(points) == 1:
+        x, y = points[0]
+        canvas[y][x] = "●"
+    else:
+        for index, point in enumerate(points):
+            endpoint_char = "●" if index == len(points) - 1 else "•"
+            if index == 0:
+                x, y = point
+                canvas[y][x] = "•"
+                continue
+            _draw_text_graph_segment(canvas, points[index - 1], point, endpoint_char=endpoint_char)
 
     graph_lines = [_meter_text_line(width, "".join(row)) for row in canvas]
     return [top, stat1, stat2, *graph_lines[:graph_height], bottom][:height]
@@ -724,15 +795,15 @@ def _pool_drain_points(samples: list[CodexPoolDrainSample], *, width_px: int, he
     baseline_y = height_px // 2
     max_amplitude = max(4, baseline_y - 8)
     values = [max(0.0, sample.rate_percent_per_hour) for sample in samples] if samples else [0.0]
-    series = _resample_series(values, max(2, right - left + 1))
-    peak = max(max(series, default=0.0), 1.5)
-    points: list[tuple[int, int]] = []
-    for index, value in enumerate(series):
-        x = left + index
-        normalized = value / peak if peak > 0 else 0.0
-        y = baseline_y - int(round(normalized * max_amplitude))
-        points.append((x, max(6, min(height_px - 7, y))))
-    return points
+    return _pool_drain_plot_points_from_values(
+        values,
+        left=left,
+        right=right,
+        baseline_y=baseline_y,
+        max_amplitude=max_amplitude,
+        min_y=6,
+        max_y=max(6, height_px - 7),
+    )
 
 
 def _build_pool_drain_png_frame(
@@ -1558,6 +1629,7 @@ class CodexAuthTui:
     def _graph_summary_lines(self, width: int) -> list[str]:
         with self._lock:
             latest = self._pool_drain_history[-1] if self._pool_drain_history else None
+            visible_polls = min(MAX_VISIBLE_POOL_DRAIN_POLLS, len(self._pool_drain_history))
         if latest is None:
             return [
                 _clip("5h token burn monitor", width - 1),
@@ -1568,14 +1640,14 @@ class CodexAuthTui:
             _clip(
                 (
                     f"drain {latest.rate_percent_per_hour:.1f} pool-%/h  •  drop {latest.dropping_accounts}/{latest.compared_accounts}  •  "
-                    f"avg left {latest.average_available_percent:.0f}%  •  auto {int(self.auto_refresh_interval_seconds)}s"
+                    f"avg left {latest.average_available_percent:.0f}%  •  {visible_polls}/{MAX_VISIBLE_POOL_DRAIN_POLLS} polls  •  auto {_format_poll_interval_seconds(self.auto_refresh_interval_seconds)}"
                 ),
                 width - 1,
             ),
         ]
 
     def _graph_signature_unlocked(self, columns: int, rows: int) -> tuple[Any, ...]:
-        history = self._pool_drain_history[-24:]
+        history = self._pool_drain_history[-MAX_VISIBLE_POOL_DRAIN_POLLS:]
         return (
             columns,
             rows,
@@ -1910,6 +1982,8 @@ def auth_view_command(args) -> None:
     provider = getattr(args, "provider", DEFAULT_PROVIDER) or DEFAULT_PROVIDER
     timeout_seconds = float(getattr(args, "timeout", 10.0) or 10.0)
     smoke_test = bool(getattr(args, "smoke_test", False))
+    poll_interval_value = getattr(args, "poll_interval", AUTO_REFRESH_INTERVAL_SECONDS)
+    poll_interval_seconds = AUTO_REFRESH_INTERVAL_SECONDS if poll_interval_value is None else max(0.0, float(poll_interval_value))
 
     if smoke_test:
         print(render_codex_auth_smoke_test(provider=provider, timeout_seconds=timeout_seconds))
@@ -1918,4 +1992,8 @@ def auth_view_command(args) -> None:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise SystemExit("`hermes auth view` requires an interactive terminal. Use `--smoke-test` for CI/non-interactive checks.")
 
-    CodexAuthTui(provider=provider, timeout_seconds=timeout_seconds).run()
+    CodexAuthTui(
+        provider=provider,
+        timeout_seconds=timeout_seconds,
+        auto_refresh_interval_seconds=poll_interval_seconds,
+    ).run()

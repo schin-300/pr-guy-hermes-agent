@@ -4611,6 +4611,12 @@ For more help on a command:
         help="Auth provider to inspect (currently only openai-codex is supported)",
     )
     auth_view.add_argument("--timeout", type=float, default=10.0, help="Per-profile usage request timeout in seconds")
+    auth_view.add_argument(
+        "--poll-interval",
+        type=float,
+        default=30.0,
+        help="Auto-refresh interval in seconds for the kitty token-burn meter (0 disables auto polling)",
+    )
     auth_view.add_argument("--smoke-test", action="store_true", help="Print a non-interactive snapshot instead of launching curses")
     auth_remove=auth_subparsers.add_parser("remove", help="Remove a pooled credential by index, id, or label")
     auth_remove.add_argument("provider", help="Provider id")

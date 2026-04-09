@@ -30,6 +30,7 @@ from hermes_cli.auth_tui import (
     _build_pool_drain_sample,
     _footer_line,
     _kitty_graphics_requested,
+    _pool_drain_points,
     _render_pool_drain_meter,
     auth_view_command,
     build_codex_profile_snapshots,
@@ -471,6 +472,51 @@ def test_render_pool_drain_meter_includes_title_stats_and_plot():
     assert any("●" in line or "•" in line for line in lines)
 
 
+def test_render_pool_drain_meter_formats_fractional_auto_refresh_seconds():
+    sample = CodexPoolDrainSample(
+        captured_at=1.0,
+        label="5h",
+        rate_percent_per_hour=12.0,
+        total_drop_percent=6.0,
+        dropping_accounts=1,
+        compared_accounts=2,
+        tracked_accounts=2,
+        resetting_accounts=0,
+        average_available_percent=77.0,
+        total_available_percent=154.0,
+        total_capacity_percent=200.0,
+    )
+
+    lines = _render_pool_drain_meter([sample], width=58, height=8, auto_refresh_seconds=7.5)
+
+    assert "auto 7.5s" in "\n".join(lines)
+
+
+def test_pool_drain_points_zoom_out_until_visible_window_fills():
+    def _sample(idx: int) -> CodexPoolDrainSample:
+        return CodexPoolDrainSample(
+            captured_at=float(idx),
+            label="5h",
+            rate_percent_per_hour=float(idx),
+            total_drop_percent=float(idx) / 2.0,
+            dropping_accounts=1,
+            compared_accounts=3,
+            tracked_accounts=4,
+            resetting_accounts=0,
+            average_available_percent=80.0,
+            total_available_percent=320.0,
+            total_capacity_percent=400.0,
+        )
+
+    short_points = _pool_drain_points([_sample(idx) for idx in range(1, 4)], width_px=160, height_px=96)
+    full_points = _pool_drain_points([_sample(idx) for idx in range(1, 41)], width_px=160, height_px=96)
+
+    assert short_points[0][0] > 100
+    assert short_points[-1][0] == 151
+    assert full_points[0][0] == 8
+    assert full_points[-1][0] == 151
+
+
 def test_kitty_graphics_requested_requires_real_tty_unless_forced():
     with patch.dict(
         "os.environ",
@@ -738,3 +784,31 @@ def test_auth_view_command_smoke_test(capsys, monkeypatch):
 
     out = capsys.readouterr().out
     assert out.strip() == "smoke ok"
+
+
+def test_auth_view_command_passes_poll_interval_to_tui(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _FakeTui:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self):
+            captured["ran"] = True
+
+    monkeypatch.setattr("hermes_cli.auth_tui.CodexAuthTui", _FakeTui)
+
+    with patch.object(sys.stdin, "isatty", return_value=True), patch.object(sys.stdout, "isatty", return_value=True):
+        auth_view_command(
+            SimpleNamespace(
+                provider="openai-codex",
+                timeout=3.0,
+                smoke_test=False,
+                poll_interval=7.5,
+            )
+        )
+
+    assert captured["provider"] == "openai-codex"
+    assert captured["timeout_seconds"] == 3.0
+    assert captured["auto_refresh_interval_seconds"] == 7.5
+    assert captured["ran"] is True
