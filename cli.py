@@ -656,6 +656,38 @@ def _git_repo_root(cwd: str | None = None) -> Optional[str]:
     return None
 
 
+def _git_common_repo_root(cwd: str | None = None) -> Optional[str]:
+    """Return the shared git checkout root for ``cwd``.
+
+    In linked worktrees this resolves the main checkout root (the parent of the
+    shared ``.git`` directory) instead of the individual worktree path.
+    """
+    import subprocess
+
+    target_cwd = cwd or os.getenv("TERMINAL_CWD") or os.getcwd()
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, timeout=5, cwd=target_cwd,
+        )
+        if result.returncode == 0:
+            common_dir_raw = result.stdout.strip()
+            if common_dir_raw:
+                common_dir = Path(common_dir_raw)
+                if not common_dir.is_absolute():
+                    common_dir = (Path(target_cwd) / common_dir).resolve()
+                if common_dir.name == ".git":
+                    return str(common_dir.parent)
+    except Exception:
+        pass
+    return _git_repo_root(cwd=target_cwd)
+
+
+def _current_hermes_checkout_root() -> Optional[str]:
+    """Return the main Hermes checkout root backing the current CLI session."""
+    return _git_common_repo_root(cwd=str(Path(__file__).resolve().parent))
+
+
 def _path_is_within_root(path: Path, root: Path) -> bool:
     """Return True when a resolved path stays within the expected root."""
     try:
@@ -665,8 +697,8 @@ def _path_is_within_root(path: Path, root: Path) -> bool:
         return False
 
 
-def _git_remote_exists(repo_root: str, remote_name: str) -> bool:
-    """Return True when ``remote_name`` exists in ``repo_root``."""
+def _git_remote_url(repo_root: str, remote_name: str) -> Optional[str]:
+    """Return the configured URL for ``remote_name`` in ``repo_root``."""
     import subprocess
 
     try:
@@ -678,8 +710,49 @@ def _git_remote_exists(repo_root: str, remote_name: str) -> bool:
             cwd=repo_root,
         )
     except Exception:
-        return False
-    return result.returncode == 0 and bool(result.stdout.strip())
+        return None
+    if result.returncode != 0:
+        return None
+    url = result.stdout.strip()
+    return url or None
+
+
+
+def _github_repo_slug_from_remote_url(remote_url: str | None) -> Optional[str]:
+    """Extract ``owner/repo`` from a GitHub remote URL when possible."""
+    if not remote_url:
+        return None
+
+    candidate = remote_url.strip()
+    if not candidate:
+        return None
+
+    if candidate.startswith("git@github.com:"):
+        candidate = candidate.split(":", 1)[1]
+    else:
+        marker = "github.com/"
+        if marker in candidate:
+            candidate = candidate.split(marker, 1)[1]
+
+    candidate = candidate.strip().lstrip("/")
+    if candidate.endswith(".git"):
+        candidate = candidate[:-4]
+    parts = [segment for segment in candidate.split("/") if segment]
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return None
+
+
+
+def _git_remote_slug(repo_root: str, remote_name: str) -> Optional[str]:
+    """Return ``owner/repo`` for a GitHub remote when it can be derived."""
+    return _github_repo_slug_from_remote_url(_git_remote_url(repo_root, remote_name))
+
+
+
+def _git_remote_exists(repo_root: str, remote_name: str) -> bool:
+    """Return True when ``remote_name`` exists in ``repo_root``."""
+    return bool(_git_remote_url(repo_root, remote_name))
 
 
 
@@ -705,7 +778,12 @@ def _git_default_base_ref(repo_root: str, remote_name: str = "origin") -> str:
     return fallback
 
 
-def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
+def _setup_worktree(
+    repo_root: str = None,
+    *,
+    branch_prefix: str = "hermes",
+    worktree_prefix: str = "hermes",
+) -> Optional[Dict[str, str]]:
     """Create an isolated git worktree for this CLI session.
 
     Returns a dict with worktree metadata on success, None on failure.
@@ -720,8 +798,10 @@ def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
         return None
 
     short_id = uuid.uuid4().hex[:8]
-    wt_name = f"hermes-{short_id}"
-    branch_name = f"hermes/{wt_name}"
+    normalized_worktree_prefix = (worktree_prefix or "hermes").replace("/", "-").strip("-") or "hermes"
+    normalized_branch_prefix = (branch_prefix or "hermes").strip("/") or "hermes"
+    wt_name = f"{normalized_worktree_prefix}-{short_id}"
+    branch_name = f"{normalized_branch_prefix}/{wt_name}"
 
     worktrees_dir = Path(repo_root) / ".worktrees"
     worktrees_dir.mkdir(parents=True, exist_ok=True)
@@ -4107,6 +4187,77 @@ class HermesCLI:
         ).strip()
         return instructions
 
+    def _build_fix_a_fork_prompt(
+        self,
+        prompt: str,
+        *,
+        worktree_info: Dict[str, str],
+        push_remote: str,
+        base_ref: str,
+        upstream_repo_slug: Optional[str] = None,
+        push_remote_slug: Optional[str] = None,
+    ) -> str:
+        base_branch = base_ref.split("/", 1)[1] if "/" in base_ref else base_ref
+        worktree_path = worktree_info["path"]
+        branch_name = worktree_info["branch"]
+        repo_root = worktree_info["repo_root"]
+        upstream_repo_slug = upstream_repo_slug or _git_remote_slug(repo_root, "origin") or "NousResearch/hermes-agent"
+        push_remote_slug = push_remote_slug or _git_remote_slug(repo_root, push_remote)
+        head_ref = branch_name
+        if push_remote_slug and push_remote_slug != upstream_repo_slug:
+            fork_owner = push_remote_slug.split("/", 1)[0]
+            if fork_owner:
+                head_ref = f"{fork_owner}:{branch_name}"
+        instructions = textwrap.dedent(
+            f"""
+            [Fix a Fork background agent]
+            You are running in a background child session cloned from the parent conversation.
+
+            Isolated coding workspace:
+            - repo root: {repo_root}
+            - worktree: {worktree_path}
+            - branch: {branch_name}
+            - preferred push remote: {push_remote}
+            - fork repo: {push_remote_slug or '(unknown)'}
+            - upstream repo: {upstream_repo_slug}
+            - base branch: {base_branch}
+
+            Required workflow:
+            1. Do repo-changing terminal and file operations only inside {worktree_path}.
+               Use terminal(..., workdir={worktree_path!r}) and file paths rooted in that worktree.
+            2. Implement the requested change, run relevant tests, and fix failures before finishing.
+            3. When the work is ready, summarize exactly what changed, why it changed, and the relevant test results.
+            4. Treat publication as separate approval levels. Ask the user which stop point they want:
+               - Commit locally only
+               - Push branch to your fork only
+               - Open a polished upstream PR
+               - Cancel
+            5. Do not move to a higher publication level unless the user explicitly approves it.
+            6. If the user chooses commit locally only: create the local commit and stop. Do not push and do not open a PR.
+            7. If the user chooses push branch to your fork only: commit, push to {push_remote}, and stop. Do not open a PR to {upstream_repo_slug}.
+            8. If the user chooses an upstream PR: first draft a high-quality PR title/body with motivation, change summary, tests, and risks; show that draft to the user for approval; only then open the PR.
+               Suggested commands after explicit PR approval:
+               - git status --short
+               - git add -A
+               - git commit -m "..."
+               - git push {push_remote} HEAD
+               - gh pr create --repo {upstream_repo_slug} --base {base_branch} --head {head_ref} --fill
+            9. Final response must include a concise status block with:
+               - Worktree
+               - Branch
+               - Tests
+               - Commit
+               - Push
+               - PR
+               - Approval
+               - Any blocker
+
+            User request:
+            {prompt}
+            """
+        ).strip()
+        return instructions
+
     def _handle_hermes_addition_command(self, cmd: str):
         """Handle /hermes-addition <prompt> — spawn a PR-oriented background worktree agent."""
         parts = cmd.strip().split(maxsplit=1)
@@ -4281,6 +4432,191 @@ class HermesCLI:
                     self._invalidate(min_interval=0)
 
         thread = threading.Thread(target=run_addition, daemon=True, name=f"hermes-addition-{task_id}")
+        self._background_tasks[task_id] = thread
+        thread.start()
+
+    def _handle_fix_a_fork_command(self, cmd: str):
+        """Handle /fix-a-fork <prompt> — spawn a Hermes-fork-focused background worktree agent."""
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            _cprint("  Usage: /fix-a-fork <prompt>")
+            _cprint("  Example: /fix-a-fork Fix the flaky retry path and prepare a PR draft")
+            _cprint("  Uses your main Hermes fork, creates an isolated experimental worktree, and separates commit/push/PR approvals.")
+            return
+
+        if not self.conversation_history:
+            _cprint("  No conversation to spawn from — send a message first.")
+            return
+
+        if not self._session_db:
+            _cprint("  Session database not available.")
+            return
+
+        if not self._ensure_runtime_credentials():
+            _cprint("  (>_<) Cannot start /fix-a-fork: no valid credentials.")
+            return
+
+        prompt = parts[1].strip()
+        repo_root = _current_hermes_checkout_root() or _git_repo_root()
+        if not repo_root:
+            _cprint("  /fix-a-fork could not resolve the main Hermes checkout.")
+            return
+
+        worktree_info = _setup_worktree(
+            repo_root=repo_root,
+            branch_prefix="experimental",
+            worktree_prefix="hermes-experimental",
+        )
+        if not worktree_info:
+            _cprint("  Failed to create an isolated worktree for /fix-a-fork.")
+            return
+
+        history_snapshot = list(self.conversation_history)
+        parent_session_id = self.session_id
+        now = datetime.now()
+        new_session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        current_title = self._session_db.get_session_title(parent_session_id)
+        child_title = self._session_db.get_next_title_in_lineage(current_title or "fix-a-fork")
+
+        try:
+            self._session_db.clone_session(
+                source_session_id=parent_session_id,
+                new_session_id=new_session_id,
+                source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                model=None,
+                model_config={
+                    "max_iterations": self.max_turns,
+                    "reasoning_config": self.reasoning_config,
+                },
+                parent_session_id=parent_session_id,
+                title=child_title,
+                messages=history_snapshot,
+            )
+        except Exception as e:
+            _cprint(f"  Failed to create /fix-a-fork session: {e}")
+            return
+
+        self._background_task_counter += 1
+        task_num = self._background_task_counter
+        task_id = f"fixafork_{now.strftime('%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        push_remote = "fork" if _git_remote_exists(repo_root, "fork") else "origin"
+        base_ref = _git_default_base_ref(repo_root, "origin")
+        upstream_repo_slug = _git_remote_slug(repo_root, "origin")
+        push_remote_slug = _git_remote_slug(repo_root, push_remote)
+        fix_prompt = self._build_fix_a_fork_prompt(
+            prompt,
+            worktree_info=worktree_info,
+            push_remote=push_remote,
+            base_ref=base_ref,
+            upstream_repo_slug=upstream_repo_slug,
+            push_remote_slug=push_remote_slug,
+        )
+        clarify_callback = self._make_background_clarify_callback(f"fix-a-fork #{task_num}")
+        _cprint(f'  🚀 Fix a Fork #{task_num} started: "{preview}"')
+        _cprint(f"  Task ID:         {task_id}")
+        _cprint(f"  Parent session:  {parent_session_id}")
+        _cprint(f"  Child session:   {new_session_id}")
+        _cprint(f"  Worktree:        {worktree_info['path']}")
+        _cprint(f"  Branch:          {worktree_info['branch']}")
+        _cprint(f"  Push remote:     {push_remote}")
+        _cprint("  Results will appear here when done.")
+        self._show_background_agent_count_note(extra_tasks=1)
+        _cprint("")
+
+        turn_route = self._resolve_turn_agent_config(prompt)
+
+        def run_fix_a_fork():
+            try:
+                fix_agent = AIAgent(
+                    model=turn_route["model"],
+                    api_key=turn_route["runtime"].get("api_key"),
+                    base_url=turn_route["runtime"].get("base_url"),
+                    provider=turn_route["runtime"].get("provider"),
+                    api_mode=turn_route["runtime"].get("api_mode"),
+                    acp_command=turn_route["runtime"].get("command"),
+                    acp_args=turn_route["runtime"].get("args"),
+                    max_iterations=self.max_turns,
+                    enabled_toolsets=self.enabled_toolsets,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    session_id=new_session_id,
+                    platform="cli",
+                    session_db=self._session_db,
+                    reasoning_config=self.reasoning_config,
+                    providers_allowed=self._providers_only,
+                    providers_ignored=self._providers_ignore,
+                    providers_order=self._providers_order,
+                    provider_sort=self._provider_sort,
+                    provider_require_parameters=self._provider_require_params,
+                    provider_data_collection=self._provider_data_collection,
+                    fallback_model=self._fallback_model,
+                    pass_session_id=False,
+                    clarify_callback=clarify_callback,
+                )
+                fix_agent._print_fn = lambda *_a, **_kw: None
+
+                def _fix_thinking(text: str) -> None:
+                    if not self._agent_running:
+                        self._spinner_text = text
+                        if self._app:
+                            self._app.invalidate()
+
+                fix_agent.thinking_callback = _fix_thinking
+                result = fix_agent.run_conversation(
+                    user_message=fix_prompt,
+                    conversation_history=history_snapshot,
+                    task_id=task_id,
+                )
+
+                response = result.get("final_response", "") if result else ""
+                if not response and result and result.get("error"):
+                    response = f"Error: {result['error']}"
+
+                if self._app:
+                    self._app.invalidate()
+                    import time as _tmod
+                    _tmod.sleep(0.05)
+                print()
+                ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
+                _cprint(f"  ✅ Fix a Fork #{task_num} complete")
+                _cprint(f"  Prompt: \"{preview}\"")
+                _cprint(f"  Worktree: {worktree_info['path']}")
+                _cprint(f"  Branch:   {worktree_info['branch']}")
+                ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
+                if response:
+                    _chat_console = ChatConsole()
+                    _chat_console.print(Panel(
+                        _rich_text_from_ansi(response),
+                        title=f"[{_accent_hex()} bold]⚕ Hermes (fix-a-fork #{task_num})[/]",
+                        title_align="left",
+                        border_style=_accent_hex(),
+                        style="#FFF8DC",
+                        box=rich_box.HORIZONTALS,
+                        padding=(1, 2),
+                    ))
+                else:
+                    _cprint("  (No response generated)")
+
+                if self.bell_on_complete:
+                    sys.stdout.write("\a")
+                    sys.stdout.flush()
+
+            except Exception as e:
+                if self._app:
+                    self._app.invalidate()
+                    import time as _tmod
+                    _tmod.sleep(0.05)
+                print()
+                _cprint(f"  ❌ Fix a Fork #{task_num} failed: {e}")
+            finally:
+                self._background_tasks.pop(task_id, None)
+                if not self._agent_running:
+                    self._spinner_text = ""
+                if self._app:
+                    self._invalidate(min_interval=0)
+
+        thread = threading.Thread(target=run_fix_a_fork, daemon=True, name=f"fix-a-fork-{task_id}")
         self._background_tasks[task_id] = thread
         thread.start()
 
@@ -5178,6 +5514,8 @@ class HermesCLI:
             self._handle_spawn_command(cmd_original)
         elif canonical == "hermes-addition":
             self._handle_hermes_addition_command(cmd_original)
+        elif canonical == "fix-a-fork":
+            self._handle_fix_a_fork_command(cmd_original)
         elif canonical == "save":
             self.save_conversation()
         elif canonical == "cron":

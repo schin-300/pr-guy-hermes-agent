@@ -134,10 +134,11 @@ def test_background_passes_background_clarify_callback_to_child_agent(cli_instan
     cli_instance._make_background_clarify_callback.assert_called_once()
 
 
-def test_hermes_addition_registered():
+def test_hermes_addition_and_fix_a_fork_registered():
     from hermes_cli.commands import COMMAND_REGISTRY
 
     assert any(command.name == "hermes-addition" for command in COMMAND_REGISTRY)
+    assert any(command.name == "fix-a-fork" for command in COMMAND_REGISTRY)
 
 
 def test_hermes_addition_creates_worktree_and_injects_pr_workflow(cli_instance):
@@ -164,4 +165,44 @@ def test_hermes_addition_creates_worktree_and_injects_pr_workflow(cli_instance):
     assert "hermes/hermes-1234" in user_message
     assert "gh pr create" in user_message
     assert "fork" in user_message
+    assert MockAgent.call_args.kwargs["clarify_callback"] == "CALLBACK"
+
+
+def test_fix_a_fork_targets_hermes_checkout_and_separates_fork_push_from_upstream_pr(cli_instance):
+    cli_instance._build_fix_a_fork_prompt = HermesCLI._build_fix_a_fork_prompt.__get__(cli_instance, HermesCLI)
+
+    with patch("cli._git_repo_root", return_value=None), \
+         patch("cli._current_hermes_checkout_root", return_value="/repo", create=True), \
+         patch("cli._setup_worktree", return_value={
+            "path": "/repo/.worktrees/hermes-experimental-1234",
+            "branch": "experimental/hermes-experimental-1234",
+            "repo_root": "/repo",
+         }) as mock_setup, \
+         patch("cli._git_remote_exists", return_value=True), \
+         patch("cli._git_default_base_ref", return_value="origin/main"), \
+         patch("cli._git_remote_url", side_effect=lambda repo_root, remote_name: {
+             "fork": "https://github.com/schin-300/pr-guy-hermes-agent.git",
+             "origin": "https://github.com/NousResearch/hermes-agent.git",
+         }[remote_name], create=True), \
+         patch("cli.threading.Thread", _ImmediateThread), \
+         patch("cli.AIAgent") as MockAgent, \
+         patch("cli.ChatConsole") as MockChatConsole:
+        MockAgent.return_value.run_conversation.return_value = {"final_response": ""}
+        MockChatConsole.return_value.print = MagicMock()
+
+        HermesCLI._handle_fix_a_fork_command(cli_instance, "/fix-a-fork Fix the flaky retry path")
+
+    mock_setup.assert_called_once_with(
+        repo_root="/repo",
+        branch_prefix="experimental",
+        worktree_prefix="hermes-experimental",
+    )
+    user_message = MockAgent.return_value.run_conversation.call_args.kwargs["user_message"]
+    assert "/repo/.worktrees/hermes-experimental-1234" in user_message
+    assert "experimental/hermes-experimental-1234" in user_message
+    assert "commit locally only" in user_message.lower()
+    assert "push branch to your fork only" in user_message.lower()
+    assert "open a polished upstream pr" in user_message.lower()
+    assert "nousresearch/hermes-agent" in user_message.lower()
+    assert "schin-300:experimental/hermes-experimental-1234" in user_message.lower()
     assert MockAgent.call_args.kwargs["clarify_callback"] == "CALLBACK"
