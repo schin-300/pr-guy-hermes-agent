@@ -599,6 +599,27 @@ def test_footer_line_prioritizes_message_visibility():
     assert "duplicate@example.com" in line
 
 
+def test_footer_line_advertises_auto_poll_hotkey():
+    line = _footer_line("", width=120)
+
+    assert "a auto" in line
+    assert "a avail" not in line
+
+
+def test_cycle_auto_refresh_interval_rotates_live_presets(monkeypatch):
+    monkeypatch.setattr("hermes_cli.auth_tui.time.time", lambda: 100.0)
+    tui = CodexAuthTui(provider="openai-codex", timeout_seconds=3.0, kitty_meter=True, auto_refresh_interval_seconds=30.0)
+
+    observed = []
+    for _ in range(8):
+        tui._cycle_auto_refresh_interval()
+        observed.append(tui.auto_refresh_interval_seconds)
+
+    assert observed == [15.0, 10.0, 5.0, 2.5, 0.0, 60.0, 120.0, 30.0]
+    assert tui._next_auto_refresh_at == 130.0
+    assert "Auto refresh" in tui.message
+
+
 def test_refresh_blocking_fetches_live_before_showing_rows(monkeypatch):
     tui = CodexAuthTui(provider="openai-codex", timeout_seconds=3.0)
     snapshots = [

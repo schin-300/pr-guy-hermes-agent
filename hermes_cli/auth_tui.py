@@ -48,6 +48,7 @@ USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 WEEKLY_RESET_GAP_SECONDS = 3 * 24 * 60 * 60
 MAX_POLL_WORKERS = 8
 AUTO_REFRESH_INTERVAL_SECONDS = 30.0
+AUTO_REFRESH_INTERVAL_PRESETS = (30.0, 15.0, 10.0, 5.0, 2.5, 0.0, 60.0, 120.0)
 KITTY_METER_MIN_WIDTH = 96
 KITTY_METER_MIN_HEIGHT = 20
 MAX_POOL_DRAIN_SAMPLES = 64
@@ -300,7 +301,7 @@ def _short_entry_id(entry_id: str) -> str:
 
 
 def _footer_line(message: str, *, width: int) -> str:
-    shortcuts = "↑↓/jk move  a avail  n name  l fresh  u refresh  r remove  q quit"
+    shortcuts = "↑↓/jk move  a auto  n name  l fresh  u refresh  r remove  q quit"
     if not message:
         return _clip(shortcuts, width)
     return _clip(f"{message}  |  {shortcuts}", width)
@@ -495,6 +496,19 @@ def _format_poll_interval_seconds(seconds: float) -> str:
     if math.isclose(seconds, rounded, abs_tol=1e-6):
         return f"{int(rounded)}s"
     return f"{seconds:.1f}".rstrip("0").rstrip(".") + "s"
+
+
+def _next_auto_refresh_interval_seconds(current: float) -> float:
+    current = max(0.0, float(current))
+    for index, preset in enumerate(AUTO_REFRESH_INTERVAL_PRESETS):
+        if math.isclose(current, preset, abs_tol=1e-6):
+            return AUTO_REFRESH_INTERVAL_PRESETS[(index + 1) % len(AUTO_REFRESH_INTERVAL_PRESETS)]
+    if current > AUTO_REFRESH_INTERVAL_PRESETS[0]:
+        return AUTO_REFRESH_INTERVAL_PRESETS[0]
+    for upper, lower in zip(AUTO_REFRESH_INTERVAL_PRESETS, AUTO_REFRESH_INTERVAL_PRESETS[1:]):
+        if upper > current > lower:
+            return lower
+    return AUTO_REFRESH_INTERVAL_PRESETS[0]
 
 
 def _pool_drain_plot_points_from_values(
@@ -1487,6 +1501,17 @@ class CodexAuthTui:
             self._selected_entry_id = selected.entry_id if selected else None
             self.message = f"Sorted by {_SORT_LABELS[self.sort_mode]}."
 
+    def _cycle_auto_refresh_interval(self) -> None:
+        with self._lock:
+            next_interval = _next_auto_refresh_interval_seconds(self.auto_refresh_interval_seconds)
+            self.auto_refresh_interval_seconds = next_interval
+            now = time.time()
+            if next_interval > 0:
+                self._next_auto_refresh_at = now + next_interval
+            else:
+                self._next_auto_refresh_at = 0.0
+            self.message = f"Auto refresh {_format_poll_interval_seconds(next_interval)}."
+
     def _finish_refresh(self, generation: int, snapshots: list[CodexProfileSnapshot], message: str) -> None:
         with self._lock:
             if generation != self._refresh_generation:
@@ -1954,6 +1979,9 @@ class CodexAuthTui:
                         self._selected_entry_id = self._selected_snapshot_unlocked().entry_id
                 continue
             if key == ord('a'):
+                self._cycle_auto_refresh_interval()
+                continue
+            if key == ord('A'):
                 self._set_sort_mode(SORT_AVAILABILITY)
                 continue
             if key == ord('n'):
