@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import struct
+import sys
 import threading
 import time
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from agent.credential_pool import PooledCredential, STATUS_EXHAUSTED
 from hermes_cli.auth_tui import (
     CodexAuthTui,
     CodexLiveStatus,
+    CodexPoolDrainSample,
     CodexProfileSnapshot,
     CodexUsageWindow,
     SORT_AVAILABILITY,
@@ -17,8 +21,16 @@ from hermes_cli.auth_tui import (
     STATE_AVAILABLE,
     STATE_DEACTIVATED,
     STATE_LIMITED,
+    _KITTY_DIACRITICS,
+    _KITTY_PLACEHOLDER,
     _boot_loading_text,
+    _build_kitty_placeholder_grid,
+    _build_kitty_transmission,
+    _build_pool_drain_png_frame,
+    _build_pool_drain_sample,
     _footer_line,
+    _kitty_graphics_requested,
+    _render_pool_drain_meter,
     auth_view_command,
     build_codex_profile_snapshots,
     render_codex_auth_smoke_test,
@@ -343,6 +355,192 @@ def test_render_codex_auth_smoke_test(monkeypatch):
 def test_boot_loading_text_is_compact_spinner_message():
     assert _boot_loading_text(0) == "Loading |"
     assert _boot_loading_text(1) == "Loading /"
+
+
+def test_build_pool_drain_sample_aggregates_5h_drops_across_accounts(monkeypatch):
+    monkeypatch.setattr("hermes_cli.auth_tui.time.time", lambda: 1800.0)
+    previous = {
+        "cred-1": (90.0, 5 * 60 * 60 * 1000),
+        "cred-2": (70.0, 5 * 60 * 60 * 1000),
+    }
+    current = [
+        CodexProfileSnapshot(
+            index=1,
+            entry_id="cred-1",
+            label="alpha@example.com",
+            display_name="alpha@example.com",
+            auth_badge="OK",
+            state=STATE_AVAILABLE,
+            state_badge="AVAIL",
+            state_reason="Available",
+            primary_window=CodexUsageWindow(label="5h", used_percent=20, reset_at_ms=5 * 60 * 60 * 1000),
+            secondary_window=None,
+        ),
+        CodexProfileSnapshot(
+            index=2,
+            entry_id="cred-2",
+            label="beta@example.com",
+            display_name="beta@example.com",
+            auth_badge="OK",
+            state=STATE_AVAILABLE,
+            state_badge="AVAIL",
+            state_reason="Available",
+            primary_window=CodexUsageWindow(label="5h", used_percent=35, reset_at_ms=5 * 60 * 60 * 1000),
+            secondary_window=None,
+        ),
+    ]
+
+    sample = _build_pool_drain_sample(
+        previous,
+        current,
+        elapsed_seconds=1800.0,
+        captured_at=1800.0,
+    )
+
+    assert sample is not None
+    assert sample.label == "5h"
+    assert sample.rate_percent_per_hour == 30.0
+    assert sample.total_drop_percent == 15.0
+    assert sample.dropping_accounts == 2
+    assert sample.compared_accounts == 2
+    assert sample.tracked_accounts == 2
+    assert sample.average_available_percent == 72.5
+
+
+def test_build_pool_drain_sample_ignores_reset_like_refills(monkeypatch):
+    monkeypatch.setattr("hermes_cli.auth_tui.time.time", lambda: 1800.0)
+    previous = {
+        "cred-1": (4.0, 5 * 60 * 60 * 1000),
+    }
+    current = [
+        CodexProfileSnapshot(
+            index=1,
+            entry_id="cred-1",
+            label="reset@example.com",
+            display_name="reset@example.com",
+            auth_badge="OK",
+            state=STATE_AVAILABLE,
+            state_badge="AVAIL",
+            state_reason="Available",
+            primary_window=CodexUsageWindow(label="5h", used_percent=2, reset_at_ms=10 * 60 * 60 * 1000),
+            secondary_window=None,
+        )
+    ]
+
+    sample = _build_pool_drain_sample(
+        previous,
+        current,
+        elapsed_seconds=1800.0,
+        captured_at=1800.0,
+    )
+
+    assert sample is not None
+    assert sample.rate_percent_per_hour == 0.0
+    assert sample.total_drop_percent == 0.0
+    assert sample.dropping_accounts == 0
+    assert sample.compared_accounts == 1
+    assert sample.resetting_accounts == 1
+
+
+def test_render_pool_drain_meter_includes_title_stats_and_plot():
+    samples = [
+        CodexPoolDrainSample(
+            captured_at=float(idx),
+            label="5h",
+            rate_percent_per_hour=float(rate),
+            total_drop_percent=float(rate) / 2.0,
+            dropping_accounts=1 if rate else 0,
+            compared_accounts=3,
+            tracked_accounts=4,
+            resetting_accounts=0,
+            average_available_percent=80.0 - idx,
+            total_available_percent=320.0 - (idx * 4.0),
+            total_capacity_percent=400.0,
+        )
+        for idx, rate in enumerate((0, 4, 11, 7, 15), start=1)
+    ]
+
+    lines = _render_pool_drain_meter(samples, width=58, height=8, auto_refresh_seconds=30.0)
+
+    assert len(lines) == 8
+    joined = "\n".join(lines)
+    assert "5h pool burn meter" in joined
+    assert "drain 15.0 pool-%/h" in joined
+    assert "drop 1/3" in joined
+    assert "auto 30s" in joined
+    assert any("●" in line or "•" in line for line in lines)
+
+
+def test_kitty_graphics_requested_requires_real_tty_unless_forced():
+    with patch.dict(
+        "os.environ",
+        {"TERM": "xterm-kitty", "KITTY_WINDOW_ID": "42", "TERM_PROGRAM": "kitty"},
+        clear=True,
+    ):
+        with patch.object(sys.stdout, "isatty", return_value=False), patch.object(
+            sys.__stdout__,
+            "isatty",
+            return_value=False,
+        ):
+            assert _kitty_graphics_requested() is False
+
+    with patch.dict(
+        "os.environ",
+        {"TERM": "xterm-kitty", "KITTY_WINDOW_ID": "42", "TERM_PROGRAM": "kitty"},
+        clear=True,
+    ):
+        with patch.object(sys.stdout, "isatty", return_value=True), patch.object(
+            sys.__stdout__,
+            "isatty",
+            return_value=True,
+        ):
+            assert _kitty_graphics_requested() is True
+
+    with patch.dict("os.environ", {"HERMES_AUTH_VIEW_FORCE_KITTY_GRAPHICS": "1"}, clear=True):
+        assert _kitty_graphics_requested() is True
+
+
+def test_kitty_placeholder_grid_uses_private_placeholder_cells():
+    lines = _build_kitty_placeholder_grid(image_id=0x123456, columns=4, rows=2)
+
+    plain = "\n".join(lines)
+    assert plain.count(_KITTY_PLACEHOLDER) == 8
+    assert len(lines) == 2
+    assert lines[0].startswith(_KITTY_PLACEHOLDER + _KITTY_DIACRITICS[0] + _KITTY_DIACRITICS[0])
+    assert _KITTY_DIACRITICS[1] in lines[1]
+
+
+def test_pool_drain_png_and_kitty_transmission_are_valid():
+    samples = [
+        CodexPoolDrainSample(
+            captured_at=float(idx),
+            label="5h",
+            rate_percent_per_hour=float(rate),
+            total_drop_percent=float(rate) / 2.0,
+            dropping_accounts=1 if rate else 0,
+            compared_accounts=3,
+            tracked_accounts=4,
+            resetting_accounts=0,
+            average_available_percent=80.0 - idx,
+            total_available_percent=320.0 - (idx * 4.0),
+            total_capacity_percent=400.0,
+        )
+        for idx, rate in enumerate((0, 4, 11, 7, 15), start=1)
+    ]
+
+    png = _build_pool_drain_png_frame(samples=samples, width_px=160, height_px=96)
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert png[12:16] == b"IHDR"
+    width, height = struct.unpack(">II", png[16:24])
+    assert (width, height) == (160, 96)
+    assert b"IDAT" in png
+    assert png.endswith(b"IEND\xaeB`\x82")
+
+    payload = _build_kitty_transmission(image_id=0x123456, png_bytes=b"x" * 4000, columns=30, rows=6)
+    assert "a=T,f=100,q=2,C=1,U=1,i=1193046" in payload
+    assert ",c=30,r=6,m=1;" in payload
+    assert payload.count("\x1b_G") > 1
+    assert "\x1b_Gm=0;" in payload
 
 
 def test_footer_line_prioritizes_message_visibility():
