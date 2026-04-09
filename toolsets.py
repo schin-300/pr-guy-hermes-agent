@@ -29,8 +29,8 @@ from typing import List, Dict, Any, Set, Optional
 # Shared tool list for CLI and all messaging platform toolsets.
 # Edit this once to update all platforms simultaneously.
 _HERMES_CORE_TOOLS = [
-    # Web
-    "web_search", "web_extract",
+    # Web + docs lookup
+    "web_search", "web_extract", "hermes_docs_lookup",
     # Terminal + process management
     "terminal", "process",
     # File manipulation
@@ -76,6 +76,12 @@ TOOLSETS = {
     "search": {
         "description": "Web search only (no content extraction/scraping)",
         "tools": ["web_search"],
+        "includes": []
+    },
+
+    "docs": {
+        "description": "Public Hermes upstream docs/code lookup with cited results",
+        "tools": ["hermes_docs_lookup"],
         "includes": []
     },
     

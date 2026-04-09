@@ -23,7 +23,7 @@ import threading
 import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -381,6 +381,68 @@ class SessionDB:
             )
         self._execute_write(_do)
         return session_id
+
+    def clone_session(
+        self,
+        source_session_id: str,
+        new_session_id: str,
+        *,
+        source: str,
+        title: str | None = None,
+        model: str = None,
+        model_config: Dict[str, Any] = None,
+        system_prompt: str = None,
+        user_id: str = None,
+        parent_session_id: str | None = None,
+        messages: Iterable[Dict[str, Any]] | None = None,
+    ) -> str:
+        """Clone a session's transcript into a new child session.
+
+        Creates the child session record, copies the provided messages (or loads
+        them from ``source_session_id`` when omitted), preserves the parent
+        linkage, and optionally sets a title. It does not end or switch the
+        source session.
+        """
+        parent_id = parent_session_id or source_session_id
+        self.create_session(
+            session_id=new_session_id,
+            source=source,
+            model=model,
+            model_config=model_config,
+            system_prompt=system_prompt,
+            user_id=user_id,
+            parent_session_id=parent_id,
+        )
+
+        source_messages = (
+            list(messages)
+            if messages is not None
+            else self.get_messages_as_conversation(source_session_id)
+        )
+        for msg in source_messages:
+            try:
+                self.append_message(
+                    session_id=new_session_id,
+                    role=msg.get("role", "user"),
+                    content=msg.get("content"),
+                    tool_name=msg.get("tool_name") or msg.get("name"),
+                    tool_calls=msg.get("tool_calls"),
+                    tool_call_id=msg.get("tool_call_id"),
+                    finish_reason=msg.get("finish_reason"),
+                    reasoning=msg.get("reasoning"),
+                    reasoning_details=msg.get("reasoning_details"),
+                    codex_reasoning_items=msg.get("codex_reasoning_items"),
+                )
+            except Exception:
+                pass  # Best-effort copy
+
+        if title:
+            try:
+                self.set_session_title(new_session_id, title)
+            except Exception:
+                pass
+
+        return new_session_id
 
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended."""

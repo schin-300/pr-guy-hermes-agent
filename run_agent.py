@@ -240,7 +240,7 @@ from agent.memory_manager import build_memory_context_block
 from agent.retry_utils import jittered_backoff
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
-    MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
+    MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, HERMES_DOCS_LOOKUP_GUIDANCE, SKILLS_GUIDANCE,
     build_nous_subscription_prompt,
 )
 from agent.model_metadata import (
@@ -667,6 +667,7 @@ class AIAgent:
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
+        context_length_override: int | None = None,
         persist_session: bool = True,
     ):
         """
@@ -709,10 +710,12 @@ class AIAgent:
             skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
                 into the system prompt. Use this for batch processing and data generation to avoid
                 polluting trajectories with user-specific persona or project instructions.
+            context_length_override (int | None): Optional session-local context window override.
         """
         _install_safe_stdio()
 
         self.model = model
+        self.context_length_override = int(context_length_override) if context_length_override else None
         self.max_iterations = max_iterations
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
@@ -1316,7 +1319,14 @@ class AIAgent:
                                     except (TypeError, ValueError):
                                         pass
                         break
-        
+
+        self._config_context_length = _config_context_length
+        _effective_context_length = (
+            self.context_length_override
+            if self.context_length_override is not None
+            else self._config_context_length
+        )
+
         self.context_compressor = ContextCompressor(
             model=self.model,
             threshold_percent=compression_threshold,
@@ -1327,7 +1337,7 @@ class AIAgent:
             quiet_mode=self.quiet_mode,
             base_url=self.base_url,
             api_key=getattr(self, "api_key", ""),
-            config_context_length=_config_context_length,
+            config_context_length=_effective_context_length,
             provider=self.provider,
         )
         self.compression_enabled = compression_enabled
@@ -1456,6 +1466,48 @@ class AIAgent:
             self.context_compressor._context_probe_persistable = False
             # Iterative summary from previous session must not bleed into new one (#2635)
             self.context_compressor._previous_summary = None
+
+    def _effective_config_context_length(self) -> int | None:
+        if self.context_length_override is not None:
+            return self.context_length_override
+        return getattr(self, "_config_context_length", None)
+
+    def _refresh_context_compressor_context_length(self) -> int | None:
+        if not hasattr(self, "context_compressor") or not self.context_compressor:
+            return None
+
+        from agent.model_metadata import get_model_context_length
+
+        new_context_length = get_model_context_length(
+            self.model,
+            base_url=self.base_url,
+            api_key=getattr(self, "api_key", ""),
+            config_context_length=self._effective_config_context_length(),
+            provider=self.provider,
+        )
+        self.context_compressor.model = self.model
+        self.context_compressor.base_url = self.base_url
+        self.context_compressor.api_key = getattr(self, "api_key", "")
+        self.context_compressor.provider = self.provider
+        self.context_compressor.context_length = new_context_length
+        self.context_compressor.threshold_tokens = int(
+            new_context_length * self.context_compressor.threshold_percent
+        )
+        return new_context_length
+
+    def set_context_length_override(self, context_length: int | None) -> int:
+        self.context_length_override = int(context_length) if context_length else None
+        refreshed = self._refresh_context_compressor_context_length()
+        if hasattr(self, "_primary_runtime") and isinstance(self._primary_runtime, dict) and refreshed:
+            self._primary_runtime.update({
+                "compressor_model": self.context_compressor.model,
+                "compressor_base_url": self.context_compressor.base_url,
+                "compressor_api_key": getattr(self.context_compressor, "api_key", ""),
+                "compressor_provider": self.context_compressor.provider,
+                "compressor_context_length": refreshed,
+                "compressor_threshold_tokens": self.context_compressor.threshold_tokens,
+            })
+        return refreshed or 0
     
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Switch the model/provider in-place for a live agent.
@@ -1527,22 +1579,7 @@ class AIAgent:
         )
 
         # ── Update context compressor ──
-        if hasattr(self, "context_compressor") and self.context_compressor:
-            from agent.model_metadata import get_model_context_length
-            new_context_length = get_model_context_length(
-                self.model,
-                base_url=self.base_url,
-                api_key=self.api_key,
-                provider=self.provider,
-            )
-            self.context_compressor.model = self.model
-            self.context_compressor.base_url = self.base_url
-            self.context_compressor.api_key = self.api_key
-            self.context_compressor.provider = self.provider
-            self.context_compressor.context_length = new_context_length
-            self.context_compressor.threshold_tokens = int(
-                new_context_length * self.context_compressor.threshold_percent
-            )
+        new_context_length = self._refresh_context_compressor_context_length()
 
         self.refresh_tool_surface(quiet_mode=True, invalidate_prompt=True)
 
@@ -2879,6 +2916,8 @@ class AIAgent:
             tool_guidance.append(MEMORY_GUIDANCE)
         if "session_search" in self.valid_tool_names:
             tool_guidance.append(SESSION_SEARCH_GUIDANCE)
+        if "hermes_docs_lookup" in self.valid_tool_names:
+            tool_guidance.append(HERMES_DOCS_LOOKUP_GUIDANCE)
         if "skill_manage" in self.valid_tool_names:
             tool_guidance.append(SKILLS_GUIDANCE)
         if tool_guidance:
@@ -5341,20 +5380,7 @@ class AIAgent:
             # Without this, compression decisions use the primary model's
             # context window (e.g. 200K) instead of the fallback's (e.g. 32K),
             # causing oversized sessions to overflow the fallback.
-            if hasattr(self, 'context_compressor') and self.context_compressor:
-                from agent.model_metadata import get_model_context_length
-                fb_context_length = get_model_context_length(
-                    self.model, base_url=self.base_url,
-                    api_key=self.api_key, provider=self.provider,
-                )
-                self.context_compressor.model = self.model
-                self.context_compressor.base_url = self.base_url
-                self.context_compressor.api_key = self.api_key
-                self.context_compressor.provider = self.provider
-                self.context_compressor.context_length = fb_context_length
-                self.context_compressor.threshold_tokens = int(
-                    fb_context_length * self.context_compressor.threshold_percent
-                )
+            self._refresh_context_compressor_context_length()
 
             self.refresh_tool_surface(quiet_mode=True, invalidate_prompt=True)
 

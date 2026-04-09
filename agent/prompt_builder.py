@@ -161,6 +161,15 @@ SESSION_SEARCH_GUIDANCE = (
     "asking them to repeat themselves."
 )
 
+HERMES_DOCS_LOOKUP_GUIDANCE = (
+    "When the user asks about Hermes Agent itself — commands, configuration, toolsets, "
+    "features, docs, architecture, or upstream implementation behavior — use "
+    "hermes_docs_lookup first when it is available. It searches the public Hermes "
+    "upstream docs/code on NousResearch/hermes-agent@main, which may differ from the "
+    "current local checkout or fork. Use local file/code tools only when the user "
+    "explicitly wants this checkout or you need local implementation details."
+)
+
 SKILLS_GUIDANCE = (
     "After completing a complex task (5+ tool calls), fixing a tricky error, "
     "or discovering a non-trivial workflow, save the approach as a "

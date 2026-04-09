@@ -30,6 +30,10 @@ class TestResolveToolset:
         tools = resolve_toolset("web")
         assert set(tools) == {"web_search", "web_extract"}
 
+    def test_docs_toolset(self):
+        tools = resolve_toolset("docs")
+        assert set(tools) == {"hermes_docs_lookup"}
+
     def test_composite_toolset(self):
         tools = resolve_toolset("debugging")
         assert "terminal" in tools
