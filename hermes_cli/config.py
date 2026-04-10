@@ -438,6 +438,26 @@ DEFAULT_CONFIG = {
         "default_wait_mode": "wait",  # wait | auto
     },
 
+    # Blocked-session helper -- a cheap continuity proxy that can take over the
+    # social/control surface while the main agent is blocked on clarify,
+    # delegated work, approvals, etc.
+    "blocked_wait_proxy": {
+        "enabled": False,
+        "model": "",
+        "provider": "",
+        "base_url": "",
+        "api_key": "",
+        "context_char_budget": 32000,
+        "setup_prompt_timeout": 90,
+        "identity_prompt": "",
+        "kinds": {
+            "clarify": {"enabled": False, "instructions": ""},
+            "delegate": {"enabled": False, "instructions": ""},
+            "approval": {"enabled": False, "instructions": ""},
+            "update": {"enabled": False, "instructions": ""},
+        },
+    },
+
     # Privacy settings
     "privacy": {
         "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context
@@ -608,7 +628,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 14,
+    "_config_version": 15,
 }
 
 # =============================================================================

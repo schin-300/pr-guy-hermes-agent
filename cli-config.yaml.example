@@ -729,6 +729,29 @@ clarify:
   default_wait_mode: wait   # wait | auto (CLI hotkeys: Esc+A auto, Esc+W wait)
 
 # =============================================================================
+# Blocked-session helper
+# =============================================================================
+# Optional cheap continuity proxy for blocked waits (clarify, delegated work,
+# approvals, update prompts). Leave model/provider/base_url empty to inherit the
+# active Hermes runtime, or point them at a cheap local Qwen-style lane.
+blocked_wait_proxy:
+  enabled: false
+  context_char_budget: 32000
+  setup_prompt_timeout: 90
+  # model: "Qwen/Qwen3-4B-Instruct"
+  # provider: "openrouter"
+  # base_url: "http://127.0.0.1:8000/v1"
+  # api_key: ""
+  # identity_prompt: "You are the blocked-session continuity proxy for Hermes."
+  kinds:
+    clarify:
+      enabled: false
+      instructions: ""
+    delegate:
+      enabled: false
+      instructions: ""
+
+# =============================================================================
 # Subagent Delegation
 # =============================================================================
 # The delegate_task tool spawns child agents with isolated context.

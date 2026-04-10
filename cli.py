@@ -283,6 +283,22 @@ def load_cli_config() -> Dict[str, Any]:
             "timeout": 120,  # Seconds of no user activity before AUTO clarify mode proceeds
             "default_wait_mode": "wait",  # wait | auto
         },
+        "blocked_wait_proxy": {
+            "enabled": False,
+            "model": "",
+            "provider": "",
+            "base_url": "",
+            "api_key": "",
+            "context_char_budget": 32000,
+            "setup_prompt_timeout": 90,
+            "identity_prompt": "",
+            "kinds": {
+                "clarify": {"enabled": False, "instructions": ""},
+                "delegate": {"enabled": False, "instructions": ""},
+                "approval": {"enabled": False, "instructions": ""},
+                "update": {"enabled": False, "instructions": ""},
+            },
+        },
         "code_execution": {
             "timeout": 300,    # Max seconds a sandbox script can run before being killed (5 min)
             "max_tool_calls": 50,  # Max RPC tool calls per execution

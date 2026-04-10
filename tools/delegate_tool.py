@@ -697,6 +697,15 @@ def delegate_task(
     n_tasks = len(task_list)
     # Track goal labels for progress display (truncated for readability)
     task_labels = [t["goal"][:40] for t in task_list]
+    if hasattr(parent_agent, "set_wait_state"):
+        try:
+            parent_agent.set_wait_state(
+                "delegate",
+                child_count=n_tasks,
+                goals=task_labels,
+            )
+        except Exception:
+            pass
 
     # Save parent tool names BEFORE any child construction mutates the global.
     # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
@@ -805,6 +814,12 @@ def delegate_task(
                 pass
 
     total_duration = round(time.monotonic() - overall_start, 2)
+
+    if hasattr(parent_agent, "clear_wait_state"):
+        try:
+            parent_agent.clear_wait_state()
+        except Exception:
+            pass
 
     return json.dumps({
         "results": results,

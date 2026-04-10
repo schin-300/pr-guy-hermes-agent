@@ -496,6 +496,7 @@ class GatewayRunner:
     # Class-level defaults so partial construction in tests doesn't
     # blow up on attribute access.
     _running_agents_ts: Dict[str, float] = {}
+    _blocked_wait_proxy_setup_pending: Dict[str, Dict[str, Any]] = {}
     
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
@@ -529,6 +530,7 @@ class GatewayRunner:
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
+        self._blocked_wait_proxy_setup_pending: Dict[str, Dict[str, Any]] = {}
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -855,6 +857,155 @@ class GatewayRunner:
             return True, await self._handle_deny_command(event)
         return False, None
 
+    def _blocked_wait_context(self, event: MessageEvent, session_key: str) -> Optional[dict]:
+        running_agent = self._running_agents.get(session_key)
+        if not running_agent or running_agent is _AGENT_PENDING_SENTINEL:
+            return None
+        if not hasattr(running_agent, "get_activity_summary"):
+            return None
+        try:
+            activity = running_agent.get_activity_summary() or {}
+        except Exception:
+            return None
+
+        wait_state = activity.get("wait_state") or {}
+        kind = wait_state.get("kind")
+        if not kind and activity.get("current_tool") == "delegate_task" and activity.get("active_children_count"):
+            kind = "delegate"
+        if not kind:
+            return None
+
+        session_entry = None
+        if getattr(self, "session_store", None) is not None:
+            try:
+                session_entry = self.session_store.get_or_create_session(event.source)
+            except Exception:
+                session_entry = None
+
+        history = []
+        if session_entry and getattr(self, "session_store", None) is not None:
+            try:
+                history = self.session_store.load_transcript(session_entry.session_id) or []
+            except Exception:
+                history = []
+
+        return {
+            "kind": str(kind),
+            "activity": activity,
+            "agent": running_agent,
+            "history": history,
+        }
+
+    async def _resolve_blocked_wait_proxy_setup(self, event: MessageEvent, session_key: str) -> tuple[bool, Optional[str]]:
+        """Prompt once to enable the blocked-session helper when a wait kind has no config."""
+        from agent.blocked_wait_proxy import (
+            blocked_wait_proxy_kind_enabled,
+            blocked_wait_proxy_setup_timeout,
+            looks_like_meta_question,
+            looks_like_no,
+            looks_like_yes,
+            save_default_blocked_wait_proxy_kind,
+        )
+
+        pending = self._blocked_wait_proxy_setup_pending.get(session_key)
+        now = time.time()
+        if pending and float(pending.get("expires_at") or 0) <= now:
+            self._blocked_wait_proxy_setup_pending.pop(session_key, None)
+            pending = None
+
+        raw = (event.text or "").strip()
+        cmd = event.get_command()
+        response_text = event.get_command_args().strip() if cmd == "answer" else raw
+
+        if pending:
+            if looks_like_yes(response_text):
+                save_default_blocked_wait_proxy_kind(pending["kind"])
+                self._blocked_wait_proxy_setup_pending.pop(session_key, None)
+                return True, (
+                    f"✅ Enabled blocked-session helper defaults for `{pending['kind']}`. "
+                    "Ask again and Hermes will answer through the helper."
+                )
+            if looks_like_no(response_text):
+                self._blocked_wait_proxy_setup_pending.pop(session_key, None)
+                return True, f"Okay — keeping blocked-session helper disabled for `{pending['kind']}`."
+            return True, f"Reply yes or no within {int(pending['expires_at'] - now)}s."
+
+        context = self._blocked_wait_context(event, session_key)
+        if not context:
+            return False, None
+        kind = context["kind"]
+        if blocked_wait_proxy_kind_enabled(kind):
+            return False, None
+        if cmd in {"answer", "approve", "deny", "stop", "status", "new", "reset"}:
+            return False, None
+        if not looks_like_meta_question(response_text):
+            return False, None
+
+        timeout = blocked_wait_proxy_setup_timeout()
+        self._blocked_wait_proxy_setup_pending[session_key] = {
+            "kind": kind,
+            "expires_at": now + timeout,
+        }
+        return True, (
+            f"I can spawn a blocked-session helper for `{kind}` waits so Hermes keeps talking in-context while the main run is blocked. "
+            f"Reply yes or no within {timeout}s."
+        )
+
+    async def _resolve_blocked_wait_proxy(self, event: MessageEvent, session_key: str) -> tuple[bool, Optional[str]]:
+        """Route blocked-state questions through the cheap continuity proxy."""
+        from agent.blocked_wait_proxy import (
+            blocked_wait_proxy_kind_enabled,
+            looks_like_abort_request,
+            looks_like_meta_question,
+            run_blocked_wait_proxy,
+        )
+
+        context = self._blocked_wait_context(event, session_key)
+        if not context:
+            return False, None
+
+        kind = context["kind"]
+        if not blocked_wait_proxy_kind_enabled(kind):
+            return False, None
+
+        raw = (event.text or "").strip()
+        cmd = event.get_command()
+        if cmd:
+            return False, None
+
+        if kind == "delegate":
+            if looks_like_abort_request(raw):
+                context["agent"].interrupt("Blocked-session helper abort requested")
+                adapter = self.adapters.get(event.source.platform)
+                if adapter:
+                    adapter.resume_typing_for_chat(event.source.chat_id)
+                return True, "⚡ Aborting the delegated work now."
+            if not looks_like_meta_question(raw):
+                return False, None  # Let normal free-text fall through as a steer/interruption request.
+        elif kind == "clarify":
+            if not looks_like_meta_question(raw):
+                return False, None
+        else:
+            if not looks_like_meta_question(raw):
+                return False, None
+
+        try:
+            response = await asyncio.to_thread(
+                run_blocked_wait_proxy,
+                kind=kind,
+                activity=context["activity"],
+                history=context["history"],
+                user_message=raw,
+                parent_agent=context["agent"],
+            )
+        except Exception as exc:
+            logger.debug("blocked wait proxy failed: %s", exc, exc_info=True)
+            return True, "I’m still blocked in that wait state, but the helper proxy failed to start."
+
+        if not response:
+            response = "I’m still blocked on that wait state, but I don’t have a useful update yet."
+        return True, response
+
     async def _resolve_clarify_wait(self, event: MessageEvent, session_key: str) -> tuple[bool, Optional[str]]:
         """Adapter for blocked clarify prompts while an agent is running."""
         from hermes_cli.commands import resolve_command as _resolve_cmd
@@ -865,16 +1016,12 @@ class GatewayRunner:
 
         cmd = event.get_command()
         cmd_def = _resolve_cmd(cmd) if cmd else None
-        response_text = None
-        if cmd_def and cmd_def.name == "answer":
-            response_text = event.get_command_args().strip()
-            if not response_text:
-                return True, "Usage: /answer <response>"
-        elif not cmd_def:
-            response_text = (event.text or "").strip()
-
-        if not response_text:
+        if not cmd_def or cmd_def.name != "answer":
             return False, None
+
+        response_text = event.get_command_args().strip()
+        if not response_text:
+            return True, "Usage: /answer <response>"
 
         count = resolve_gateway_clarify(session_key, response_text)
         if not count:
@@ -891,10 +1038,11 @@ class GatewayRunner:
 
         This is the base path for user input that arrives while Hermes is paused
         behind a blocking interaction. Each waiting flow contributes a small
-        adapter (`update`, `approval`, `clarify`) instead of open-coding command
-        handling in multiple branches.
+        adapter instead of open-coding command handling in multiple branches.
         """
         for adapter in (
+            self._resolve_blocked_wait_proxy_setup,
+            self._resolve_blocked_wait_proxy,
             self._resolve_update_prompt_wait,
             self._resolve_approval_wait,
             self._resolve_clarify_wait,
@@ -1604,6 +1752,7 @@ class GatewayRunner:
         for session_key, agent in list(self._running_agents.items()):
             from tools.clarify_tool import clear_gateway_clarify_session
             clear_gateway_clarify_session(session_key)
+            self._blocked_wait_proxy_setup_pending.pop(session_key, None)
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
             try:
@@ -2042,6 +2191,7 @@ class GatewayRunner:
                     running_agent.interrupt("Stop requested")
                 from tools.clarify_tool import clear_gateway_clarify_session
                 clear_gateway_clarify_session(_quick_key)
+                self._blocked_wait_proxy_setup_pending.pop(_quick_key, None)
                 # Force-clean: remove the session lock regardless of agent state
                 adapter = self.adapters.get(source.platform)
                 if adapter and hasattr(adapter, 'get_pending_message'):
@@ -2065,6 +2215,7 @@ class GatewayRunner:
                     running_agent.interrupt("Session reset requested")
                 from tools.clarify_tool import clear_gateway_clarify_session
                 clear_gateway_clarify_session(_quick_key)
+                self._blocked_wait_proxy_setup_pending.pop(_quick_key, None)
                 # Clear any pending messages so the old text doesn't replay
                 adapter = self.adapters.get(source.platform)
                 if adapter and hasattr(adapter, 'get_pending_message'):
@@ -3574,6 +3725,7 @@ class GatewayRunner:
             # Force-clean the sentinel so the session is unlocked.
             from tools.clarify_tool import clear_gateway_clarify_session
             clear_gateway_clarify_session(session_key)
+            self._blocked_wait_proxy_setup_pending.pop(session_key, None)
             if session_key in self._running_agents:
                 del self._running_agents[session_key]
             logger.info("HARD STOP (pending) for session %s — sentinel cleared", session_key[:20])
@@ -3582,6 +3734,7 @@ class GatewayRunner:
             agent.interrupt("Stop requested")
             from tools.clarify_tool import clear_gateway_clarify_session
             clear_gateway_clarify_session(session_key)
+            self._blocked_wait_proxy_setup_pending.pop(session_key, None)
             # Force-clean the session lock so a truly hung agent doesn't
             # keep it locked forever.
             if session_key in self._running_agents:
@@ -5642,6 +5795,12 @@ class GatewayRunner:
         _adapter = self.adapters.get(source.platform)
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
+        running_agent = self._running_agents.get(session_key)
+        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL and hasattr(running_agent, "clear_wait_state"):
+            try:
+                running_agent.clear_wait_state()
+            except Exception:
+                pass
 
         count_msg = f" ({count} commands)" if count > 1 else ""
         logger.info("User approved %d dangerous command(s) via /approve%s", count, scope_msg)
@@ -5679,6 +5838,12 @@ class GatewayRunner:
         _adapter = self.adapters.get(source.platform)
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
+        running_agent = self._running_agents.get(session_key)
+        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL and hasattr(running_agent, "clear_wait_state"):
+            try:
+                running_agent.clear_wait_state()
+            except Exception:
+                pass
 
         count_msg = f" ({count} commands)" if count > 1 else ""
         logger.info("User denied %d dangerous command(s) via /deny", count)
@@ -7103,6 +7268,16 @@ class GatewayRunner:
                 # status; pausing prevents _keep_typing from re-setting it.
                 # Typing resumes in _handle_approve_command/_handle_deny_command.
                 _status_adapter.pause_typing_for_chat(_status_chat_id)
+                _agent = agent_holder[0]
+                if _agent and hasattr(_agent, "set_wait_state"):
+                    try:
+                        _agent.set_wait_state(
+                            "approval",
+                            mode="wait",
+                            question_preview=str(approval_data.get("description") or "Dangerous command approval")[:160],
+                        )
+                    except Exception:
+                        pass
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
