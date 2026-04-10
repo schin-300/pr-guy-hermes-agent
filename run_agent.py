@@ -1301,6 +1301,7 @@ class AIAgent:
             _compression_cfg = {}
         compression_threshold = float(_compression_cfg.get("threshold", 0.50))
         compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in ("true", "1", "yes")
+        compression_mode = str(_compression_cfg.get("mode", "summary") or "summary").strip().lower()
         compression_summary_model = _compression_cfg.get("summary_model") or None
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
@@ -1357,6 +1358,7 @@ class AIAgent:
             api_key=getattr(self, "api_key", ""),
             config_context_length=_effective_context_length,
             provider=self.provider,
+            mode=compression_mode,
         )
         self.compression_enabled = compression_enabled
         self._subdirectory_hints = SubdirectoryHintTracker(
@@ -1407,7 +1409,11 @@ class AIAgent:
 
         if not self.quiet_mode:
             if compression_enabled:
-                print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (compress at {int(compression_threshold*100)}% = {self.context_compressor.threshold_tokens:,})")
+                print(
+                    f"📊 Context limit: {self.context_compressor.context_length:,} tokens "
+                    f"(compress at {int(compression_threshold*100)}% = {self.context_compressor.threshold_tokens:,}, "
+                    f"mode={self.context_compressor.mode})"
+                )
             else:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (auto-compression disabled)")
 
@@ -1429,6 +1435,7 @@ class AIAgent:
             "compressor_base_url": _cc.base_url,
             "compressor_api_key": getattr(_cc, "api_key", ""),
             "compressor_provider": _cc.provider,
+            "compressor_mode": _cc.mode,
             "compressor_context_length": _cc.context_length,
             "compressor_threshold_tokens": _cc.threshold_tokens,
         }
@@ -1536,6 +1543,7 @@ class AIAgent:
             "compressor_base_url": self.context_compressor.base_url,
             "compressor_api_key": getattr(self.context_compressor, "api_key", ""),
             "compressor_provider": self.context_compressor.provider,
+            "compressor_mode": self.context_compressor.mode,
             "compressor_context_length": refreshed,
             "compressor_threshold_percent": self.context_compressor.threshold_percent,
             "compressor_threshold_tokens": self.context_compressor.threshold_tokens,
@@ -1546,11 +1554,16 @@ class AIAgent:
         *,
         context_length: int | None = None,
         compression_threshold: float | None = None,
+        compression_mode: str | None = None,
     ) -> int:
         if context_length is not None:
             self.context_length_override = int(context_length) if context_length else None
-        if compression_threshold is not None and hasattr(self, "context_compressor") and self.context_compressor:
-            self.context_compressor.threshold_percent = float(compression_threshold)
+        if hasattr(self, "context_compressor") and self.context_compressor:
+            if compression_threshold is not None:
+                self.context_compressor.threshold_percent = float(compression_threshold)
+            if compression_mode is not None:
+                mode = str(compression_mode or "summary").strip().lower()
+                self.context_compressor.mode = mode if mode in {"summary", "timeline"} else "summary"
 
         refreshed = self._refresh_context_compressor_context_length()
         if refreshed and compression_threshold is not None:
@@ -1649,6 +1662,7 @@ class AIAgent:
             "compressor_base_url": _cc.base_url if _cc else self.base_url,
             "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",
             "compressor_provider": _cc.provider if _cc else self.provider,
+            "compressor_mode": _cc.mode if _cc else "summary",
             "compressor_context_length": _cc.context_length if _cc else 0,
             "compressor_threshold_tokens": _cc.threshold_tokens if _cc else 0,
         }
@@ -5997,7 +6011,9 @@ class AIAgent:
             cc.base_url = rt["compressor_base_url"]
             cc.api_key = rt["compressor_api_key"]
             cc.provider = rt["compressor_provider"]
+            cc.mode = rt.get("compressor_mode", cc.mode)
             cc.context_length = rt["compressor_context_length"]
+            cc.threshold_percent = rt.get("compressor_threshold_percent", cc.threshold_percent)
             cc.threshold_tokens = rt["compressor_threshold_tokens"]
 
             self.refresh_tool_surface(quiet_mode=True, invalidate_prompt=True)
@@ -7192,6 +7208,34 @@ class AIAgent:
                 self._todo_write_opt_in = False
         return result
 
+    def _invoke_session_search_tool(self, function_args: Dict[str, Any]) -> str:
+        if not self._session_db:
+            return json.dumps({"success": False, "error": "Session database not available."})
+        from tools.session_search_tool import session_search as _session_search
+        return _session_search(
+            query=function_args.get("query", ""),
+            role_filter=function_args.get("role_filter"),
+            limit=function_args.get("limit", 3),
+            db=self._session_db,
+            current_session_id=self.session_id,
+        )
+
+    def _invoke_session_timeline_tool(self, function_args: Dict[str, Any]) -> str:
+        if not self._session_db:
+            return json.dumps({"success": False, "error": "Session database not available."})
+        from tools.session_timeline_tool import session_timeline as _session_timeline
+        return _session_timeline(
+            query=function_args.get("query"),
+            before=function_args.get("before"),
+            after=function_args.get("after"),
+            limit=function_args.get("limit", 32),
+            offset=function_args.get("offset", 0),
+            include_tools=function_args.get("include_tools", False),
+            max_chars=function_args.get("max_chars", 24000),
+            db=self._session_db,
+            current_session_id=self.session_id,
+        )
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None) -> str:
         """Invoke a single tool and return the result string. No display logic.
@@ -7203,16 +7247,9 @@ class AIAgent:
         if function_name == "todo":
             return self._invoke_todo_tool(function_args)
         elif function_name == "session_search":
-            if not self._session_db:
-                return json.dumps({"success": False, "error": "Session database not available."})
-            from tools.session_search_tool import session_search as _session_search
-            return _session_search(
-                query=function_args.get("query", ""),
-                role_filter=function_args.get("role_filter"),
-                limit=function_args.get("limit", 3),
-                db=self._session_db,
-                current_session_id=self.session_id,
-            )
+            return self._invoke_session_search_tool(function_args)
+        elif function_name == "session_timeline":
+            return self._invoke_session_timeline_tool(function_args)
         elif function_name == "memory":
             return self._handle_builtin_memory_tool(function_args)
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
@@ -7564,20 +7601,15 @@ class AIAgent:
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
             elif function_name == "session_search":
-                if not self._session_db:
-                    function_result = json.dumps({"success": False, "error": "Session database not available."})
-                else:
-                    from tools.session_search_tool import session_search as _session_search
-                    function_result = _session_search(
-                        query=function_args.get("query", ""),
-                        role_filter=function_args.get("role_filter"),
-                        limit=function_args.get("limit", 3),
-                        db=self._session_db,
-                        current_session_id=self.session_id,
-                    )
+                function_result = self._invoke_session_search_tool(function_args)
                 tool_duration = time.time() - tool_start_time
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
+            elif function_name == "session_timeline":
+                function_result = self._invoke_session_timeline_tool(function_args)
+                tool_duration = time.time() - tool_start_time
+                if self.quiet_mode:
+                    self._vprint(f"  {_get_cute_tool_message_impl('session_timeline', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
                 function_result = self._handle_builtin_memory_tool(function_args)
                 tool_duration = time.time() - tool_start_time

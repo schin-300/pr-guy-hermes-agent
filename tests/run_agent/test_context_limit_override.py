@@ -72,6 +72,19 @@ def test_set_context_profile_updates_threshold_and_runtime():
     assert agent._primary_runtime["compressor_threshold_percent"] == 0.95
 
 
+def test_set_context_profile_updates_compression_mode():
+    agent = _build_agent()
+
+    agent.set_context_profile(
+        context_length=1_000_000,
+        compression_threshold=0.95,
+        compression_mode="timeline",
+    )
+
+    assert agent.context_compressor.mode == "timeline"
+    assert agent._primary_runtime["compressor_mode"] == "timeline"
+
+
 def test_switch_model_preserves_context_length_override():
     agent = _build_agent(context_length_override=500_000)
 

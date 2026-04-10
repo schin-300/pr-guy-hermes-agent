@@ -153,6 +153,7 @@ def _discover_tools():
         "tools.todo_tool",
         "tools.memory_tool",
         "tools.session_search_tool",
+        "tools.session_timeline_tool",
         "tools.clarify_tool",
         "tools.code_execution_tool",
         "tools.delegate_tool",

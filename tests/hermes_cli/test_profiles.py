@@ -13,11 +13,13 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
+import yaml
 
 from hermes_cli.profiles import (
     validate_profile_name,
     get_profile_dir,
     create_profile,
+    customize_profile,
     delete_profile,
     list_profiles,
     set_active_profile,
@@ -178,6 +180,22 @@ class TestCreateProfile:
         assert not (profile_dir / "config.yaml").exists()
         assert not (profile_dir / ".env").exists()
         assert not (profile_dir / "SOUL.md").exists()
+
+    def test_customize_profile_writes_context_and_prompt(self, profile_env):
+        profile_dir = create_profile("coder", no_alias=True)
+        config_path = customize_profile(
+            profile_dir,
+            context_length=1_000_000,
+            compression_threshold=0.95,
+            compression_mode="timeline",
+            system_prompt="Arr, but keep it professional.",
+        )
+
+        data = yaml.safe_load(config_path.read_text())
+        assert data["model"]["context_length"] == 1_000_000
+        assert data["compression"]["threshold"] == 0.95
+        assert data["compression"]["mode"] == "timeline"
+        assert data["agent"]["system_prompt"] == "Arr, but keep it professional."
 
 
 # ===================================================================

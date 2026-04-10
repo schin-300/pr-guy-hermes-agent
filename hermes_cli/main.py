@@ -3916,7 +3916,7 @@ def _coalesce_session_name_args(argv: list) -> list:
 def cmd_profile(args):
     """Profile management — create, delete, list, switch, alias."""
     from hermes_cli.profiles import (
-        list_profiles, create_profile, delete_profile, seed_profile_skills,
+        list_profiles, create_profile, customize_profile, delete_profile, seed_profile_skills,
         set_active_profile, get_active_profile_name,
         check_alias_collision, create_wrapper_script, remove_wrapper_script,
         _is_wrapper_dir_in_path, _get_wrapper_dir,
@@ -3985,9 +3985,27 @@ def cmd_profile(args):
         clone = getattr(args, "clone", False)
         clone_all = getattr(args, "clone_all", False)
         no_alias = getattr(args, "no_alias", False)
+        raw_context_length = getattr(args, "context_length", None)
+        compression_threshold = getattr(args, "compression_threshold", None)
+        compression_mode = getattr(args, "compression_mode", None)
+        system_prompt = getattr(args, "system_prompt", None)
+        system_prompt_file = getattr(args, "system_prompt_file", None)
 
         try:
             clone_from = getattr(args, "clone_from", None)
+            parsed_context_length = None
+            if raw_context_length:
+                from hermes_cli.context_limit import parse_context_limit_value
+                parsed_context_length = parse_context_limit_value(str(raw_context_length))
+                if parsed_context_length is None:
+                    raise ValueError(f"Invalid context length: {raw_context_length!r}")
+
+            resolved_system_prompt = system_prompt
+            if system_prompt_file:
+                prompt_path = Path(system_prompt_file).expanduser()
+                if not prompt_path.exists():
+                    raise FileNotFoundError(f"System prompt file not found: {prompt_path}")
+                resolved_system_prompt = prompt_path.read_text(encoding="utf-8").strip()
 
             profile_dir = create_profile(
                 name=name,
@@ -4004,6 +4022,16 @@ def cmd_profile(args):
                     print(f"Full copy from {source_label}.")
                 else:
                     print(f"Cloned config, .env, SOUL.md from {source_label}.")
+
+            if any(v is not None for v in (parsed_context_length, compression_threshold, compression_mode, resolved_system_prompt)):
+                config_path = customize_profile(
+                    profile_dir,
+                    context_length=parsed_context_length,
+                    compression_threshold=compression_threshold,
+                    compression_mode=compression_mode,
+                    system_prompt=resolved_system_prompt,
+                )
+                print(f"Profile config customized: {config_path}")
 
             # Auto-clone Honcho config for the new profile (only with --clone/--clone-all)
             if clone or clone_all:
@@ -5535,6 +5563,17 @@ For more help on a command:
                                 help="Source profile to clone from (default: active)")
     profile_create.add_argument("--no-alias", action="store_true",
                                 help="Skip wrapper script creation")
+    profile_create.add_argument("--context-length", metavar="TOKENS",
+                                help="Set model.context_length for the new profile (e.g. 1m, 272k, 500000)")
+    profile_create.add_argument("--compression-threshold", type=float,
+                                help="Set compression.threshold for the new profile (e.g. 0.95)")
+    profile_create.add_argument("--compression-mode", choices=["summary", "timeline"],
+                                help="Set compression.mode for the new profile")
+    prompt_group = profile_create.add_mutually_exclusive_group()
+    prompt_group.add_argument("--system-prompt", metavar="TEXT",
+                              help="Set agent.system_prompt for the new profile")
+    prompt_group.add_argument("--system-prompt-file", metavar="FILE",
+                              help="Read agent.system_prompt for the new profile from a file")
 
     profile_delete = profile_subparsers.add_parser("delete", help="Delete a profile")
     profile_delete.add_argument("profile_name", help="Profile to delete")

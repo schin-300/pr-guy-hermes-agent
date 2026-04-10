@@ -33,6 +33,12 @@ SUMMARY_PREFIX = (
     "and the current state to continue from where things left off, and "
     "avoid repeating work:"
 )
+TIMELINE_PREFIX = (
+    "[RAW SESSION TIMELINE] Earlier turns were removed from the active prompt "
+    "to save context space, but the full unedited transcript is preserved in "
+    "the current session lineage. Use the session_timeline tool to pull raw "
+    "chronological chunks — recent-first by default, or query/date range when needed."
+)
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 
 # Minimum tokens for the summary output
@@ -74,11 +80,15 @@ class ContextCompressor:
         api_key: str = "",
         config_context_length: int | None = None,
         provider: str = "",
+        mode: str = "summary",
     ):
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
         self.provider = provider
+        self.mode = (mode or "summary").strip().lower()
+        if self.mode not in {"summary", "timeline"}:
+            self.mode = "summary"
         self.threshold_percent = threshold_percent
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
@@ -104,10 +114,11 @@ class ContextCompressor:
             logger.info(
                 "Context compressor initialized: model=%s context_length=%d "
                 "threshold=%d (%.0f%%) target_ratio=%.0f%% tail_budget=%d "
-                "provider=%s base_url=%s",
+                "mode=%s provider=%s base_url=%s",
                 model, self.context_length, self.threshold_tokens,
                 threshold_percent * 100, self.summary_target_ratio * 100,
                 self.tail_token_budget,
+                self.mode,
                 provider or "none", base_url or "none",
             )
         self._context_probed = False  # True after a step-down from context error
@@ -146,6 +157,7 @@ class ContextCompressor:
             "context_length": self.context_length,
             "usage_percent": min(100, (self.last_prompt_tokens / self.context_length * 100)) if self.context_length else 0,
             "compression_count": self.compression_count,
+            "mode": self.mode,
         }
 
     # ------------------------------------------------------------------
@@ -438,6 +450,17 @@ Write only the summary body. Do not include any preamble or prefix."""
                 break
         return f"{SUMMARY_PREFIX}\n{text}" if text else SUMMARY_PREFIX
 
+    def _build_timeline_handoff(self, turns_to_archive: List[Dict[str, Any]]) -> str:
+        """Build a raw-history handoff that points the model to session_timeline."""
+        archived_count = len(turns_to_archive)
+        archived_non_tool = sum(1 for msg in turns_to_archive if msg.get("role") != "tool")
+        return (
+            f"{TIMELINE_PREFIX}\n"
+            f"Archived raw chunk: {archived_count} messages ({archived_non_tool} non-tool) are no longer in the live prompt.\n"
+            "If older details matter, call session_timeline with no query to scan the newest raw chunk, "
+            "or provide query/before/after to pull a raw contiguous window from the session lineage."
+        )
+
     # ------------------------------------------------------------------
     # Tool-call / tool-result pair integrity helpers
     # ------------------------------------------------------------------
@@ -500,7 +523,7 @@ Write only the summary body. Do not include any preamble or prefix."""
                         if cid in missing_results:
                             patched.append({
                                 "role": "tool",
-                                "content": "[Result from earlier conversation — see context summary above]",
+                                "content": "[Result from earlier conversation — see context handoff above]",
                                 "tool_call_id": cid,
                             })
             messages = patched
@@ -669,7 +692,8 @@ Write only the summary body. Do not include any preamble or prefix."""
             )
             tail_msgs = n_messages - compress_end
             logger.info(
-                "Summarizing turns %d-%d (%d turns), protecting %d head + %d tail messages",
+                "%s turns %d-%d (%d turns), protecting %d head + %d tail messages",
+                "Archiving raw" if self.mode == "timeline" else "Summarizing",
                 compress_start + 1,
                 compress_end,
                 len(turns_to_summarize),
@@ -677,54 +701,53 @@ Write only the summary body. Do not include any preamble or prefix."""
                 tail_msgs,
             )
 
-        # Phase 3: Generate structured summary
-        summary = self._generate_summary(turns_to_summarize)
+        # Phase 3: Build the compaction handoff
+        handoff = (
+            self._build_timeline_handoff(turns_to_summarize)
+            if self.mode == "timeline"
+            else self._generate_summary(turns_to_summarize)
+        )
 
         # Phase 4: Assemble compressed message list
         compressed = []
         for i in range(compress_start):
             msg = messages[i].copy()
             if i == 0 and msg.get("role") == "system" and self.compression_count == 0:
-                msg["content"] = (
-                    (msg.get("content") or "")
-                    + "\n\n[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work.]"
+                note = (
+                    "[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. "
+                    "The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work.]"
+                    if self.mode != "timeline"
+                    else "[Note: Some earlier conversation turns are no longer in the live prompt, but their full raw transcript is preserved in the session lineage and can be retrieved with session_timeline.]"
                 )
+                msg["content"] = ((msg.get("content") or "") + "\n\n" + note)
             compressed.append(msg)
 
-        _merge_summary_into_tail = False
-        if summary:
+        _merge_handoff_into_tail = False
+        if handoff:
             last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"
             first_tail_role = messages[compress_end].get("role", "user") if compress_end < n_messages else "user"
-            # Pick a role that avoids consecutive same-role with both neighbors.
-            # Priority: avoid colliding with head (already committed), then tail.
             if last_head_role in ("assistant", "tool"):
-                summary_role = "user"
+                handoff_role = "user"
             else:
-                summary_role = "assistant"
-            # If the chosen role collides with the tail AND flipping wouldn't
-            # collide with the head, flip it.
-            if summary_role == first_tail_role:
-                flipped = "assistant" if summary_role == "user" else "user"
+                handoff_role = "assistant"
+            if handoff_role == first_tail_role:
+                flipped = "assistant" if handoff_role == "user" else "user"
                 if flipped != last_head_role:
-                    summary_role = flipped
+                    handoff_role = flipped
                 else:
-                    # Both roles would create consecutive same-role messages
-                    # (e.g. head=assistant, tail=user — neither role works).
-                    # Merge the summary into the first tail message instead
-                    # of inserting a standalone message that breaks alternation.
-                    _merge_summary_into_tail = True
-            if not _merge_summary_into_tail:
-                compressed.append({"role": summary_role, "content": summary})
+                    _merge_handoff_into_tail = True
+            if not _merge_handoff_into_tail:
+                compressed.append({"role": handoff_role, "content": handoff})
         else:
             if not self.quiet_mode:
                 logger.debug("No summary model available — middle turns dropped without summary")
 
         for i in range(compress_end, n_messages):
             msg = messages[i].copy()
-            if _merge_summary_into_tail and i == compress_end:
+            if _merge_handoff_into_tail and i == compress_end:
                 original = msg.get("content") or ""
-                msg["content"] = summary + "\n\n" + original
-                _merge_summary_into_tail = False
+                msg["content"] = handoff + "\n\n" + original
+                _merge_handoff_into_tail = False
             compressed.append(msg)
 
         self.compression_count += 1

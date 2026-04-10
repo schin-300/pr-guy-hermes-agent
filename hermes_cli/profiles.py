@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional
 
+import yaml
+
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 # Directories bootstrapped inside every new profile
@@ -445,6 +447,52 @@ def create_profile(
                     shutil.copy2(src, dst)
 
     return profile_dir
+
+
+def customize_profile(
+    profile_dir: Path,
+    *,
+    context_length: int | None = None,
+    compression_threshold: float | None = None,
+    compression_mode: str | None = None,
+    system_prompt: str | None = None,
+) -> Path:
+    """Apply persistent config customizations to a profile.
+
+    Used after ``create_profile()`` so callers can clone a profile and then pin a
+    long-context / persona mode without manual YAML editing.
+    """
+    config_path = profile_dir / "config.yaml"
+    config: dict = {}
+    if config_path.exists():
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        if isinstance(loaded, dict):
+            config = loaded
+
+    if context_length is not None:
+        model_cfg = config.setdefault("model", {})
+        model_cfg["context_length"] = int(context_length)
+
+    if compression_threshold is not None or compression_mode is not None:
+        compression_cfg = config.setdefault("compression", {})
+        if compression_threshold is not None:
+            compression_cfg["threshold"] = float(compression_threshold)
+        if compression_mode is not None:
+            mode = str(compression_mode or "summary").strip().lower()
+            compression_cfg["mode"] = mode if mode in {"summary", "timeline"} else "summary"
+
+    if system_prompt is not None:
+        agent_cfg = config.setdefault("agent", {})
+        agent_cfg["system_prompt"] = str(system_prompt)
+
+    from utils import atomic_yaml_write
+
+    atomic_yaml_write(config_path, config)
+    try:
+        os.chmod(config_path, 0o600)
+    except (OSError, NotImplementedError):
+        pass
+    return config_path
 
 
 def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict]:

@@ -595,6 +595,29 @@ class SessionDB:
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    def get_session_lineage_ids(self, session_id: str) -> List[str]:
+        """Return the direct ancestor chain for a session from root -> current.
+
+        Compression continuations form a parent-linked chain via
+        ``parent_session_id``.  For raw current-chat recall we only need the
+        active session's ancestry, not sibling branches created by other forks.
+        """
+        if not session_id:
+            return []
+
+        lineage: list[str] = []
+        seen: set[str] = set()
+        current = session_id
+        while current and current not in seen:
+            seen.add(current)
+            session = self.get_session(current)
+            if not session:
+                break
+            lineage.append(current)
+            current = session.get("parent_session_id")
+        lineage.reverse()
+        return lineage
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
@@ -992,6 +1015,120 @@ class SessionDB:
             messages.append(msg)
         return messages
 
+    def get_lineage_recent_messages(
+        self,
+        session_id: str,
+        *,
+        limit: int = 32,
+        offset: int = 0,
+        include_tools: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return the newest raw messages from a session lineage.
+
+        The SQL query fetches newest-first for speed, then we reverse in Python so
+        callers always receive a chronological chunk.
+        """
+        lineage_ids = self.get_session_lineage_ids(session_id)
+        if not lineage_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in lineage_ids)
+        where = [f"m.session_id IN ({placeholders})"]
+        params: list[Any] = list(lineage_ids)
+        if not include_tools:
+            where.append("m.role != 'tool'")
+
+        params.extend([max(1, int(limit)), max(0, int(offset))])
+        sql = f"""
+            SELECT m.id, m.session_id, m.role, m.content, m.tool_name, m.tool_call_id,
+                   m.tool_calls, m.timestamp
+            FROM messages m
+            WHERE {' AND '.join(where)}
+            ORDER BY m.timestamp DESC, m.id DESC
+            LIMIT ? OFFSET ?
+        """
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def get_lineage_messages_between(
+        self,
+        session_id: str,
+        *,
+        after_ts: float | None = None,
+        before_ts: float | None = None,
+        limit: int = 120,
+        include_tools: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return raw lineage messages inside an optional timestamp range."""
+        lineage_ids = self.get_session_lineage_ids(session_id)
+        if not lineage_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in lineage_ids)
+        where = [f"m.session_id IN ({placeholders})"]
+        params: list[Any] = list(lineage_ids)
+        if after_ts is not None:
+            where.append("m.timestamp >= ?")
+            params.append(float(after_ts))
+        if before_ts is not None:
+            where.append("m.timestamp <= ?")
+            params.append(float(before_ts))
+        if not include_tools:
+            where.append("m.role != 'tool'")
+
+        params.append(max(1, int(limit)))
+        sql = f"""
+            SELECT m.id, m.session_id, m.role, m.content, m.tool_name, m.tool_call_id,
+                   m.tool_calls, m.timestamp
+            FROM messages m
+            WHERE {' AND '.join(where)}
+            ORDER BY m.timestamp, m.id
+            LIMIT ?
+        """
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_lineage_window_around_message(
+        self,
+        session_id: str,
+        *,
+        message_id: int,
+        before: int = 16,
+        after: int = 16,
+        include_tools: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return a contiguous chronological lineage window around one message."""
+        lineage_ids = self.get_session_lineage_ids(session_id)
+        if not lineage_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in lineage_ids)
+        where = [f"m.session_id IN ({placeholders})"]
+        params: list[Any] = list(lineage_ids)
+        if not include_tools:
+            where.append("m.role != 'tool'")
+        params.extend([int(message_id), max(0, int(before)), max(0, int(after))])
+        sql = f"""
+            WITH lineage AS (
+                SELECT m.id, m.session_id, m.role, m.content, m.tool_name, m.tool_call_id,
+                       m.tool_calls, m.timestamp,
+                       ROW_NUMBER() OVER (ORDER BY m.timestamp, m.id) AS seq
+                FROM messages m
+                WHERE {' AND '.join(where)}
+            ), anchor AS (
+                SELECT seq FROM lineage WHERE id = ?
+            )
+            SELECT id, session_id, role, content, tool_name, tool_call_id, tool_calls, timestamp
+            FROM lineage
+            WHERE seq BETWEEN (SELECT seq FROM anchor) - ? AND (SELECT seq FROM anchor) + ?
+            ORDER BY seq
+        """
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
     # =========================================================================
     # Search
     # =========================================================================
@@ -1151,6 +1288,47 @@ class SessionDB:
             match.pop("content", None)
 
         return matches
+
+    def search_lineage_messages(
+        self,
+        session_id: str,
+        query: str,
+        *,
+        include_tools: bool = False,
+        limit: int = 8,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Search only the active session lineage using FTS5 with recency tie-breaks."""
+        lineage_ids = self.get_session_lineage_ids(session_id)
+        if not lineage_ids:
+            return []
+
+        query = self._sanitize_fts5_query(query)
+        if not query:
+            return []
+
+        placeholders = ",".join("?" for _ in lineage_ids)
+        where = ["messages_fts MATCH ?", f"m.session_id IN ({placeholders})"]
+        params: list[Any] = [query, *lineage_ids]
+        if not include_tools:
+            where.append("m.role != 'tool'")
+        params.extend([max(1, int(limit)), max(0, int(offset))])
+        sql = f"""
+            SELECT m.id, m.session_id, m.role, m.content, m.tool_name, m.timestamp,
+                   snippet(messages_fts, 0, '>>>', '<<<', '...', 24) AS snippet,
+                   bm25(messages_fts) AS rank
+            FROM messages_fts
+            JOIN messages m ON m.id = messages_fts.rowid
+            WHERE {' AND '.join(where)}
+            ORDER BY rank ASC, m.timestamp DESC, m.id DESC
+            LIMIT ? OFFSET ?
+        """
+        with self._lock:
+            try:
+                rows = self._conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        return [dict(row) for row in rows]
 
     def search_sessions(
         self,

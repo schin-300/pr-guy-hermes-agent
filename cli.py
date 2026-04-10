@@ -231,6 +231,7 @@ def load_cli_config() -> Dict[str, Any]:
         "compression": {
             "enabled": True,      # Auto-compress when approaching context limit
             "threshold": 0.50,    # Compress at 50% of model's context limit
+            "mode": "summary",   # summary = lossy handoff, timeline = raw-lineage handoff + session_timeline
             "summary_model": "",  # Model for summaries (empty = use main model)
         },
         "smart_model_routing": {

@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX
+from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX, TIMELINE_PREFIX
 
 
 @pytest.fixture()
@@ -73,6 +73,7 @@ class TestGetStatus:
         assert "context_length" in status
         assert "usage_percent" in status
         assert "compression_count" in status
+        assert "mode" in status
 
     def test_usage_percent_calculation(self, compressor):
         compressor.last_prompt_tokens = 50000
@@ -116,6 +117,23 @@ class TestCompress:
         # (head=assistant, tail=user in this fixture).  Verify the
         # original content is present in either case.
         assert msgs[-2]["content"] in result[-2]["content"]
+
+    def test_timeline_mode_uses_raw_handoff_without_llm_summary(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=2,
+                protect_last_n=2,
+                quiet_mode=True,
+                mode="timeline",
+            )
+        msgs = self._make_messages(10)
+        with patch("agent.context_compressor.call_llm") as mock_call:
+            result = c.compress(msgs)
+        assert mock_call.call_count == 0
+        assert any(TIMELINE_PREFIX in (msg.get("content") or "") for msg in result)
+        assert c.compression_count == 1
 
 
 class TestGenerateSummaryNoneContent:
