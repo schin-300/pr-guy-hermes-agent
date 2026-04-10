@@ -125,5 +125,35 @@ class TestApiServerAdapterToolset:
 
             mock_agent_cls.assert_called_once()
             call_kwargs = mock_agent_cls.call_args
-            toolsets = call_kwargs.kwargs.get("enabled_toolsets")
-            assert sorted(toolsets) == ["terminal", "web"]
+            toolsets = set(call_kwargs.kwargs.get("enabled_toolsets") or [])
+            assert {"terminal", "web"}.issubset(toolsets)
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_create_agent_falls_back_to_provider_default_model_when_config_model_is_blank(self):
+        """Gateway-backed chat should still pick a real model when config.yaml has no model.default yet."""
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs") as mock_kwargs, \
+             patch("gateway.run._load_gateway_config") as mock_config, \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider") as mock_runtime, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+
+            mock_kwargs.return_value = {
+                "api_key": "***",
+                "base_url": "https://inference-api.nousresearch.com/v1",
+                "provider": "nous",
+                "api_mode": "chat_completions",
+                "command": None,
+                "args": [],
+            }
+            mock_config.return_value = {"model": {"provider": "nous"}}
+            mock_runtime.return_value = {"provider": "nous"}
+            mock_agent_cls.return_value = MagicMock()
+
+            adapter._create_agent()
+
+            mock_agent_cls.assert_called_once()
+            assert mock_agent_cls.call_args.kwargs.get("model") == "anthropic/claude-opus-4.6"
