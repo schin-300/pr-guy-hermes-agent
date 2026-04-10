@@ -84,6 +84,6 @@ async def test_runner_allows_cron_only_mode_when_no_platforms_are_enabled(monkey
 
     assert ok is True
     assert runner.should_exit_cleanly is False
-    assert runner.adapters == {}
+    assert list(runner.adapters) == [Platform.API_SERVER]
     state = read_runtime_status()
     assert state["gateway_state"] == "running"

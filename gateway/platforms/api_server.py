@@ -305,6 +305,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._response_store = ResponseStore()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        # Live agent refs for cancellation: run_id -> [agent_or_none]
+        self._run_agents: Dict[str, list[Any]] = {}
+        # Background asyncio task wrappers for live runs
+        self._run_tasks: Dict[str, "asyncio.Task[Any]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
@@ -407,24 +411,37 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
+        model_override: Optional[str] = None,
+        runtime_overrides: Optional[Dict[str, Any]] = None,
+        enabled_toolsets_override: Optional[List[str]] = None,
+        service_tier: Optional[str] = None,
+        context_length_override: Optional[int] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
 
         Uses _resolve_runtime_agent_kwargs() to pick up model, api_key,
-        base_url, etc. from config.yaml / env vars.  Toolsets are resolved
-        from config.yaml platform_toolsets.api_server (same as all other
-        gateway platforms), falling back to the hermes-api-server default.
+        base_url, etc. from config.yaml / env vars. Toolsets normally come
+        from config.yaml platform_toolsets.api_server, but trusted local CLI
+        clients can override them for gateway-managed terminal sessions.
         """
         from run_agent import AIAgent
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = _resolve_gateway_model()
+        if runtime_overrides:
+            for key in ("provider", "api_key", "base_url", "api_mode"):
+                value = runtime_overrides.get(key)
+                if value not in (None, ""):
+                    runtime_kwargs[key] = value
+
+        model = model_override or _resolve_gateway_model()
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if enabled_toolsets_override:
+            enabled_toolsets = sorted(str(tool) for tool in enabled_toolsets_override if str(tool).strip())
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -447,6 +464,8 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
+            service_tier=service_tier,
+            context_length_override=context_length_override,
         )
         return agent
 
@@ -1426,6 +1445,23 @@ class APIServerAdapter(BasePlatformAdapter):
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+        runtime_overrides = {
+            "provider": body.get("provider"),
+            "api_key": body.get("api_key"),
+            "base_url": body.get("base_url"),
+            "api_mode": body.get("api_mode"),
+        }
+        model_override = body.get("model")
+        toolsets_override = body.get("toolsets")
+        if toolsets_override is not None and not isinstance(toolsets_override, list):
+            return web.json_response(_openai_error("'toolsets' must be an array when provided"), status=400)
+        service_tier = body.get("service_tier")
+        context_length_override = body.get("context_length_override")
+        if context_length_override is not None:
+            try:
+                context_length_override = int(context_length_override)
+            except (TypeError, ValueError):
+                return web.json_response(_openai_error("'context_length_override' must be an integer"), status=400)
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
@@ -1471,6 +1507,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         session_id = body.get("session_id") or run_id
         ephemeral_system_prompt = instructions
+        agent_ref: list[Any] = [None]
+        self._run_agents[run_id] = agent_ref
 
         async def _run_and_close():
             try:
@@ -1479,7 +1517,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    model_override=model_override,
+                    runtime_overrides=runtime_overrides,
+                    enabled_toolsets_override=toolsets_override,
+                    service_tier=service_tier,
+                    context_length_override=context_length_override,
                 )
+                agent_ref[0] = agent
+
                 def _run_sync():
                     r = agent.run_conversation(
                         user_message=user_message,
@@ -1513,6 +1558,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                self._run_agents.pop(run_id, None)
+                self._run_tasks.pop(run_id, None)
                 # Sentinel: signal SSE stream to close
                 try:
                     q.put_nowait(None)
@@ -1520,6 +1567,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
 
         task = asyncio.create_task(_run_and_close())
+        self._run_tasks[run_id] = task
         try:
             self._background_tasks.add(task)
         except TypeError:
@@ -1527,7 +1575,45 @@ class APIServerAdapter(BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
-        return web.json_response({"run_id": run_id, "status": "started"}, status=202)
+        return web.json_response({"run_id": run_id, "status": "started", "session_id": session_id}, status=202)
+
+    async def _handle_cancel_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/cancel — interrupt an in-flight gateway run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        agent_ref = self._run_agents.get(run_id)
+        task = self._run_tasks.get(run_id)
+        if agent_ref is None and task is None:
+            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+
+        interrupted = False
+        agent = agent_ref[0] if agent_ref else None
+        if agent is not None:
+            try:
+                agent.interrupt("Run cancelled by client")
+                interrupted = True
+            except Exception:
+                logger.debug("[api_server] failed to interrupt run %s", run_id, exc_info=True)
+
+        q = self._run_streams.get(run_id)
+        if q is not None:
+            try:
+                q.put_nowait({
+                    "event": "run.cancelled",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "reason": "Run cancelled by client",
+                })
+            except Exception:
+                pass
+
+        return web.json_response(
+            {"run_id": run_id, "status": "cancelling", "interrupted": interrupted},
+            status=202,
+        )
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
@@ -1626,6 +1712,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._app.router.add_post("/v1/runs/{run_id}/cancel", self._handle_cancel_run)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

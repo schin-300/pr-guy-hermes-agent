@@ -12,6 +12,7 @@ Tests cover:
 - Error handling (invalid JSON, missing fields)
 """
 
+import asyncio
 import json
 import time
 import uuid
@@ -225,6 +226,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+    app.router.add_post("/v1/runs/{run_id}/cancel", adapter._handle_cancel_run)
     return app
 
 
@@ -973,6 +977,29 @@ class TestConfigIntegration:
         config.platforms[Platform.API_SERVER] = PlatformConfig(enabled=False)
         connected = config.get_connected_platforms()
         assert Platform.API_SERVER not in connected
+
+
+class TestRunsCancellation:
+    @pytest.mark.asyncio
+    async def test_cancel_endpoint_interrupts_active_run(self, adapter):
+        app = _create_app(adapter)
+        run_id = "run_test_cancel"
+        agent = MagicMock()
+        adapter._run_agents[run_id] = [agent]
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_streams_created[run_id] = time.time()
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/v1/runs/{run_id}/cancel")
+            assert resp.status == 202
+            data = await resp.json()
+            assert data["run_id"] == run_id
+            assert data["status"] == "cancelling"
+
+        agent.interrupt.assert_called_once()
+        queued = adapter._run_streams[run_id].get_nowait()
+        assert queued["event"] == "run.cancelled"
+        assert queued["run_id"] == run_id
 
 
 # ---------------------------------------------------------------------------

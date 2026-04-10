@@ -223,6 +223,7 @@ if not _configured_cwd or _configured_cwd in (".", "auto", "cwd"):
 
 from gateway.config import (
     Platform,
+    PlatformConfig,
     GatewayConfig,
     load_gateway_config,
 )
@@ -474,6 +475,11 @@ class GatewayRunner:
     
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
+        api_server_cfg = self.config.platforms.get(Platform.API_SERVER)
+        if api_server_cfg is None:
+            self.config.platforms[Platform.API_SERVER] = PlatformConfig(enabled=True)
+        else:
+            api_server_cfg.enabled = True
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
 
         # Load ephemeral config from config.yaml / env vars.

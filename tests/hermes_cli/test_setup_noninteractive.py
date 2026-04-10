@@ -91,7 +91,8 @@ class TestNonInteractiveSetup:
         assert exc.value.code == 1
         mock_setup.assert_not_called()
         out = capsys.readouterr().out
-        assert "hermes config set model.provider custom" in out
+        assert "requires a running local gateway session bridge" in out
+        assert "hermes gateway run" in out
 
     def test_returning_user_terminal_menu_choice_dispatches_terminal_section(self, tmp_path):
         """Returning-user menu should map Terminal Backend to the terminal setup, not TTS."""

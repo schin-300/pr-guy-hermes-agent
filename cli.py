@@ -1455,6 +1455,7 @@ class HermesCLI:
         resume: str = None,
         checkpoints: bool = False,
         pass_session_id: bool = False,
+        gateway_session_mode: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -1474,6 +1475,7 @@ class HermesCLI:
         # Initialize Rich console
         self.console = Console()
         self.config = CLI_CONFIG
+        self.gateway_session_mode = bool(gateway_session_mode)
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
         # YAML 1.1 parses bare `off` as boolean False — normalise to string.
@@ -3677,66 +3679,100 @@ class HermesCLI:
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
             effective_model = model_override or self.model
-            self.agent = AIAgent(
-                model=effective_model,
-                api_key=runtime.get("api_key"),
-                base_url=runtime.get("base_url"),
-                provider=runtime.get("provider"),
-                api_mode=runtime.get("api_mode"),
-                service_tier=self.codex_service_tier,
-                acp_command=runtime.get("command"),
-                acp_args=runtime.get("args"),
-                credential_pool=runtime.get("credential_pool"),
-                max_iterations=self.max_turns,
-                enabled_toolsets=self.enabled_toolsets,
-                verbose_logging=self.verbose,
-                quiet_mode=not self.verbose,
-                ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
-                prefill_messages=self.prefill_messages or None,
-                reasoning_config=self.reasoning_config,
-                extra_body_config=self.extra_body_config,
-                providers_allowed=self._providers_only,
-                providers_ignored=self._providers_ignore,
-                providers_order=self._providers_order,
-                provider_sort=self._provider_sort,
-                provider_require_parameters=self._provider_require_params,
-                provider_data_collection=self._provider_data_collection,
-                session_id=self.session_id,
-                platform="cli",
-                session_db=self._session_db,
-                clarify_callback=self._clarify_callback,
-                reasoning_callback=self._current_reasoning_callback(),
+            if self.gateway_session_mode:
+                from hermes_cli.gateway_session_client import (
+                    GatewaySessionAgentProxy,
+                    check_gateway_session_endpoint,
+                    resolve_gateway_session_endpoint,
+                )
 
-                fallback_model=self._fallback_model,
-                context_length_override=self.context_length_override,
-                thinking_callback=self._on_thinking,
-                checkpoints_enabled=self.checkpoints_enabled,
-                checkpoint_max_snapshots=self.checkpoint_max_snapshots,
-                pass_session_id=self.pass_session_id,
-                tool_progress_callback=self._on_tool_progress,
-                tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
-                tool_complete_callback=self._on_tool_complete,
-                stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
-                tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
-            )
-            self._set_session_context_profile(
-                context_length=self.context_length_override,
-                compression_threshold=self.context_compaction_threshold,
-            )
-            try:
-                local_store = getattr(self, "_local_todo_store", None)
-                if local_store and hasattr(local_store, "read") and hasattr(self.agent, "_todo_store"):
-                    seed_items = local_store.read()
-                    if seed_items and not self.agent._todo_store.has_items():
-                        self.agent._todo_store.write(seed_items, merge=False)
-            except Exception:
-                pass
-            # Store reference for atexit memory provider shutdown
-            global _active_agent_ref
-            _active_agent_ref = self.agent
-            # Route agent status output through prompt_toolkit so ANSI escape
-            # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
-            self.agent._print_fn = _cprint
+                endpoint = resolve_gateway_session_endpoint()
+                if not check_gateway_session_endpoint(endpoint):
+                    ChatConsole().print(
+                        "[bold red]Gateway session mode requires a running local gateway API server.[/]\n"
+                        "Start it with [bold]hermes gateway run[/] (or restart the gateway service)."
+                    )
+                    return False
+
+                self.agent = GatewaySessionAgentProxy(
+                    endpoint=endpoint,
+                    session_id=self.session_id,
+                    model=effective_model,
+                    provider=runtime.get("provider"),
+                    api_key=runtime.get("api_key"),
+                    base_url=runtime.get("base_url"),
+                    api_mode=runtime.get("api_mode"),
+                    enabled_toolsets=self.enabled_toolsets,
+                    service_tier=self.codex_service_tier,
+                    context_length_override=self.context_length_override,
+                    compression_threshold=self.context_compaction_threshold,
+                    verbose_logging=self.verbose,
+                    quiet_mode=not self.verbose,
+                    ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
+                    tool_progress_callback=self._on_tool_progress,
+                    reasoning_callback=self._current_reasoning_callback(),
+                )
+            else:
+                self.agent = AIAgent(
+                    model=effective_model,
+                    api_key=runtime.get("api_key"),
+                    base_url=runtime.get("base_url"),
+                    provider=runtime.get("provider"),
+                    api_mode=runtime.get("api_mode"),
+                    service_tier=self.codex_service_tier,
+                    acp_command=runtime.get("command"),
+                    acp_args=runtime.get("args"),
+                    credential_pool=runtime.get("credential_pool"),
+                    max_iterations=self.max_turns,
+                    enabled_toolsets=self.enabled_toolsets,
+                    verbose_logging=self.verbose,
+                    quiet_mode=not self.verbose,
+                    ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
+                    prefill_messages=self.prefill_messages or None,
+                    reasoning_config=self.reasoning_config,
+                    extra_body_config=self.extra_body_config,
+                    providers_allowed=self._providers_only,
+                    providers_ignored=self._providers_ignore,
+                    providers_order=self._providers_order,
+                    provider_sort=self._provider_sort,
+                    provider_require_parameters=self._provider_require_params,
+                    provider_data_collection=self._provider_data_collection,
+                    session_id=self.session_id,
+                    platform="cli",
+                    session_db=self._session_db,
+                    clarify_callback=self._clarify_callback,
+                    reasoning_callback=self._current_reasoning_callback(),
+
+                    fallback_model=self._fallback_model,
+                    context_length_override=self.context_length_override,
+                    thinking_callback=self._on_thinking,
+                    checkpoints_enabled=self.checkpoints_enabled,
+                    checkpoint_max_snapshots=self.checkpoint_max_snapshots,
+                    pass_session_id=self.pass_session_id,
+                    tool_progress_callback=self._on_tool_progress,
+                    tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
+                    tool_complete_callback=self._on_tool_complete,
+                    stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
+                    tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
+                )
+                self._set_session_context_profile(
+                    context_length=self.context_length_override,
+                    compression_threshold=self.context_compaction_threshold,
+                )
+                try:
+                    local_store = getattr(self, "_local_todo_store", None)
+                    if local_store and hasattr(local_store, "read") and hasattr(self.agent, "_todo_store"):
+                        seed_items = local_store.read()
+                        if seed_items and not self.agent._todo_store.has_items():
+                            self.agent._todo_store.write(seed_items, merge=False)
+                except Exception:
+                    pass
+                # Store reference for atexit memory provider shutdown
+                global _active_agent_ref
+                _active_agent_ref = self.agent
+                # Route agent status output through prompt_toolkit so ANSI escape
+                # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
+                self.agent._print_fn = _cprint
             self._active_agent_route_signature = (
                 effective_model,
                 runtime.get("provider"),
@@ -11310,6 +11346,12 @@ def main(
     
     parsed_skills = _parse_skills_argument(skills)
 
+    gateway_session_mode = (
+        not query
+        and str(os.getenv("HERMES_GATEWAY_SESSION_MODE", "1")).strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+
     # Create CLI instance
     cli = HermesCLI(
         model=model,
@@ -11323,6 +11365,7 @@ def main(
         resume=resume,
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
+        gateway_session_mode=gateway_session_mode,
     )
 
     if parsed_skills:

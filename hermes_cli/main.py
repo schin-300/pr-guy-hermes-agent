@@ -585,8 +585,15 @@ def cmd_chat(args):
         # If resolution fails, keep the original value — _init_agent will
         # report "Session not found" with the original input
 
-    # First-run guard: check if any provider is configured before launching
-    if not _has_any_provider_configured():
+    gateway_session_mode = (
+        not getattr(args, "query", None)
+        and str(os.getenv("HERMES_GATEWAY_SESSION_MODE", "1")).strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+
+    # First-run guard: interactive gateway-backed CLI sessions use the gateway's
+    # runtime, so they do not require a locally configured provider.
+    if not gateway_session_mode and not _has_any_provider_configured():
         print()
         print("It looks like Hermes isn't configured yet -- no API keys or providers found.")
         print()
@@ -611,6 +618,24 @@ def cmd_chat(args):
         print()
         print("You can run 'hermes setup' at any time to configure.")
         sys.exit(1)
+
+    if gateway_session_mode:
+        try:
+            from hermes_cli.gateway_session_client import (
+                check_gateway_session_endpoint,
+                resolve_gateway_session_endpoint,
+            )
+            endpoint = resolve_gateway_session_endpoint()
+            if not check_gateway_session_endpoint(endpoint):
+                print()
+                print("Hermes interactive chat now requires a running local gateway session bridge.")
+                print()
+                print("  Start it with:  hermes gateway run")
+                print()
+                sys.exit(1)
+        except Exception as exc:
+            print(f"Error checking gateway session bridge: {exc}")
+            sys.exit(1)
 
     # Start update check in background (runs while other init happens)
     try:
