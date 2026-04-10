@@ -2,6 +2,7 @@
 that only manifest at runtime (not in mocked unit tests)."""
 
 import os
+import queue
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -182,6 +183,51 @@ class TestSingleQueryState:
         assert cli._voice_tts_done.is_set()
         assert hasattr(cli, "_interrupt_queue")
         assert hasattr(cli, "_pending_input")
+
+
+class TestBackgroundCompletionNotifications:
+    def test_duplicate_completion_for_same_process_is_only_queued_once(self):
+        cli = _make_cli()
+        completion = {
+            "session_id": "proc_dup",
+            "command": "./.venv/bin/asi-headspace --host 127.0.0.1 --port 31999",
+            "exit_code": -15,
+            "output": "headspace listening on http://127.0.0.1:31999\n",
+        }
+
+        assert cli._queue_background_completion_notification(completion) is True
+        assert cli._queue_background_completion_notification(completion) is False
+
+        queued = cli._pending_input.get_nowait()
+        assert "proc_dup" in queued
+        assert cli._pending_input.empty()
+
+    def test_distinct_completion_processes_are_both_queued(self):
+        cli = _make_cli()
+        first = {
+            "session_id": "proc_one",
+            "command": "echo one",
+            "exit_code": 0,
+            "output": "one",
+        }
+        second = {
+            "session_id": "proc_two",
+            "command": "echo two",
+            "exit_code": 0,
+            "output": "two",
+        }
+
+        assert cli._queue_background_completion_notification(first) is True
+        assert cli._queue_background_completion_notification(second) is True
+
+        queued = [cli._pending_input.get_nowait(), cli._pending_input.get_nowait()]
+        assert any("proc_one" in item for item in queued)
+        assert any("proc_two" in item for item in queued)
+        with patch("cli._cprint"):
+            with patch("tools.process_registry.process_registry") as mock_registry:
+                mock_registry.completion_queue = queue.Queue()
+                cli._drain_background_completion_notifications()
+        assert cli._pending_input.empty()
 
 
 class TestHistoryDisplay:

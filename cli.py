@@ -1687,6 +1687,7 @@ class HermesCLI:
         self._tool_boundary_input_queue = queue.Queue()
         self._active_agent_thread = None
         self._should_exit = False
+        self._seen_background_completion_ids: set[str] = set()
         self._detaching_gateway_session = False
         self._closing_gateway_session = False
         self._launch_sessions_browser = False
@@ -2375,6 +2376,43 @@ class HermesCLI:
                 return "queued for next tool call · Enter again to send now · Ctrl+C to cancel"
             return "type a message + Enter to queue after the next tool call · Ctrl+C to cancel"
         return "type a message + Enter to interrupt immediately · Ctrl+C to cancel"
+
+    def _queue_background_completion_notification(self, completion: dict) -> bool:
+        """Queue a synthetic background-process completion prompt once per process id."""
+        session_id = str(completion.get("session_id") or "").strip()
+        dedupe_key = session_id or (
+            f"{completion.get('command', '')}|{completion.get('exit_code', '')}|{completion.get('output', '')}"
+        )
+        with self._background_prompt_lock:
+            if dedupe_key in self._seen_background_completion_ids:
+                return False
+            self._seen_background_completion_ids.add(dedupe_key)
+
+        exit_code = completion.get("exit_code", "?")
+        command = completion.get("command", "unknown")
+        output = completion.get("output", "")
+        synth = (
+            f"[SYSTEM: Background process {session_id or 'unknown'} completed "
+            f"(exit code {exit_code}).\n"
+            f"Command: {command}\n"
+            f"Output:\n{output}]"
+        )
+        self._pending_input.put(synth)
+        return True
+
+    def _drain_background_completion_notifications(self) -> None:
+        """Move queued process completions into pending input, deduped by process id."""
+        try:
+            from tools.process_registry import process_registry
+        except Exception:
+            return
+
+        while not process_registry.completion_queue.empty():
+            try:
+                completion = process_registry.completion_queue.get_nowait()
+            except Exception:
+                break
+            self._queue_background_completion_notification(completion)
 
     def _submit_busy_input(self, payload) -> str:
         """Route user input submitted while the agent is already generating."""
@@ -9809,6 +9847,7 @@ class HermesCLI:
         self._tool_boundary_input_queue = queue.Queue()
         self._active_agent_thread = None         # The currently-running agent worker thread for busy-command routing
         self._should_exit = False
+        self._seen_background_completion_ids = set()
         self._last_ctrl_c_time = 0  # Track double Ctrl+C for force exit
 
         # Give plugin manager a CLI reference so plugins can inject messages
@@ -11064,20 +11103,7 @@ class HermesCLI:
                             # Check for background process completion notifications
                             # while the agent is idle (user hasn't typed anything yet).
                             try:
-                                from tools.process_registry import process_registry
-                                if not process_registry.completion_queue.empty():
-                                    completion = process_registry.completion_queue.get_nowait()
-                                    _exit = completion.get("exit_code", "?")
-                                    _cmd = completion.get("command", "unknown")
-                                    _sid = completion.get("session_id", "unknown")
-                                    _out = completion.get("output", "")
-                                    _synth = (
-                                        f"[SYSTEM: Background process {_sid} completed "
-                                        f"(exit code {_exit}).\n"
-                                        f"Command: {_cmd}\n"
-                                        f"Output:\n{_out}]"
-                                    )
-                                    self._pending_input.put(_synth)
+                                self._drain_background_completion_notifications()
                             except Exception:
                                 pass
                         continue
@@ -11199,20 +11225,7 @@ class HermesCLI:
                         # agent was running (or before) gets auto-injected as a
                         # new user message so the agent can react to it.
                         try:
-                            from tools.process_registry import process_registry
-                            while not process_registry.completion_queue.empty():
-                                completion = process_registry.completion_queue.get_nowait()
-                                _exit = completion.get("exit_code", "?")
-                                _cmd = completion.get("command", "unknown")
-                                _sid = completion.get("session_id", "unknown")
-                                _out = completion.get("output", "")
-                                _synth = (
-                                    f"[SYSTEM: Background process {_sid} completed "
-                                    f"(exit code {_exit}).\n"
-                                    f"Command: {_cmd}\n"
-                                    f"Output:\n{_out}]"
-                                )
-                                self._pending_input.put(_synth)
+                            self._drain_background_completion_notifications()
                         except Exception:
                             pass  # Non-fatal — don't break the main loop
 
