@@ -200,6 +200,30 @@ def test_runtime_resolution_rebuilds_agent_on_routing_change(monkeypatch):
     assert shell.api_mode == "codex_responses"
 
 
+def test_runtime_resolution_backfills_blank_model_from_provider_default(monkeypatch):
+    cli = _import_cli()
+
+    def _runtime_resolve(**kwargs):
+        return {
+            "provider": "nous",
+            "api_mode": "chat_completions",
+            "base_url": "https://inference-api.nousresearch.com/v1",
+            "api_key": "***",
+            "source": "portal",
+        }
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+
+    shell = cli.HermesCLI(model="", compact=True, max_turns=1)
+    shell.model = ""
+    shell._model_is_default = True
+
+    assert shell._ensure_runtime_credentials() is True
+    assert shell.provider == "nous"
+    assert shell.model == "anthropic/claude-opus-4.6"
+
+
 def test_cli_turn_routing_uses_primary_when_disabled(monkeypatch):
     cli = _import_cli()
     shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)

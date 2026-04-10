@@ -3060,6 +3060,21 @@ class HermesCLI:
         except Exception:
             return [("class:status-bar", f" {self._build_status_bar_text()} ")]
 
+    def _fallback_model_for_provider(self, resolved_provider: str) -> str:
+        """Return a stable default model slug for a provider when config is blank."""
+        try:
+            from hermes_cli.models import OPENROUTER_MODELS, _PROVIDER_MODELS, normalize_provider
+
+            normalized = normalize_provider(resolved_provider)
+            if normalized == "openrouter":
+                return OPENROUTER_MODELS[0][0] if OPENROUTER_MODELS else ""
+            provider_models = _PROVIDER_MODELS.get(normalized, [])
+            if provider_models:
+                return str(provider_models[0]).strip()
+        except Exception:
+            logger.debug("Could not derive fallback model for provider %s", resolved_provider, exc_info=True)
+        return ""
+
     def _normalize_model_for_provider(self, resolved_provider: str) -> bool:
         """Normalize provider-specific model IDs and routing."""
         current_model = (self.model or "").strip()
@@ -3592,6 +3607,11 @@ class HermesCLI:
         # Normalize model for the resolved provider (e.g. swap non-Codex
         # models when provider is openai-codex).  Fixes #651.
         model_changed = self._normalize_model_for_provider(resolved_provider)
+        if not (self.model or "").strip():
+            fallback_model = self._fallback_model_for_provider(resolved_provider)
+            if fallback_model:
+                self.model = fallback_model
+                model_changed = True
 
         # AIAgent/OpenAI client holds auth at init time, so rebuild if key,
         # routing, or the effective model changed.
