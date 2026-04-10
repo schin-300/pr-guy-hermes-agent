@@ -239,6 +239,84 @@ from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 
 
+_ALLOWLIST_RELEVANT_PLATFORMS = {
+    Platform.TELEGRAM,
+    Platform.DISCORD,
+    Platform.WHATSAPP,
+    Platform.SLACK,
+    Platform.SIGNAL,
+    Platform.EMAIL,
+    Platform.SMS,
+    Platform.MATTERMOST,
+    Platform.MATRIX,
+    Platform.DINGTALK,
+    Platform.FEISHU,
+    Platform.WECOM,
+    Platform.BLUEBUBBLES,
+}
+
+
+def _gateway_allow_all_enabled() -> bool:
+    """Return the global allow-all policy, defaulting to enabled when unset."""
+    # Agent note (2026-04-10 00:10:03 EDT): Hermes changed the default so
+    # GATEWAY_ALLOW_ALL_USERS now behaves like true when the env var is unset.
+    raw_value = os.getenv("GATEWAY_ALLOW_ALL_USERS")
+    if raw_value is None or not raw_value.strip():
+        return True
+    return raw_value.strip().lower() in ("true", "1", "yes")
+
+
+def should_warn_missing_allowlists(config: GatewayConfig) -> bool:
+    """Return True when enabled user-facing platforms lack allowlist/open-access config."""
+    enabled_user_facing = {
+        platform
+        for platform, platform_config in (config.platforms or {}).items()
+        if getattr(platform_config, "enabled", False) and platform in _ALLOWLIST_RELEVANT_PLATFORMS
+    }
+    if not enabled_user_facing:
+        return False
+
+    any_allowlist = any(
+        os.getenv(v)
+        for v in (
+            "TELEGRAM_ALLOWED_USERS",
+            "DISCORD_ALLOWED_USERS",
+            "WHATSAPP_ALLOWED_USERS",
+            "SLACK_ALLOWED_USERS",
+            "SIGNAL_ALLOWED_USERS",
+            "SIGNAL_GROUP_ALLOWED_USERS",
+            "EMAIL_ALLOWED_USERS",
+            "SMS_ALLOWED_USERS",
+            "MATTERMOST_ALLOWED_USERS",
+            "MATRIX_ALLOWED_USERS",
+            "DINGTALK_ALLOWED_USERS",
+            "FEISHU_ALLOWED_USERS",
+            "WECOM_ALLOWED_USERS",
+            "BLUEBUBBLES_ALLOWED_USERS",
+            "GATEWAY_ALLOWED_USERS",
+        )
+    )
+    allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
+        os.getenv(v, "").lower() in ("true", "1", "yes")
+        for v in (
+            "TELEGRAM_ALLOW_ALL_USERS",
+            "DISCORD_ALLOW_ALL_USERS",
+            "WHATSAPP_ALLOW_ALL_USERS",
+            "SLACK_ALLOW_ALL_USERS",
+            "SIGNAL_ALLOW_ALL_USERS",
+            "EMAIL_ALLOW_ALL_USERS",
+            "SMS_ALLOW_ALL_USERS",
+            "MATTERMOST_ALLOW_ALL_USERS",
+            "MATRIX_ALLOW_ALL_USERS",
+            "DINGTALK_ALLOW_ALL_USERS",
+            "FEISHU_ALLOW_ALL_USERS",
+            "WECOM_ALLOW_ALL_USERS",
+            "BLUEBUBBLES_ALLOW_ALL_USERS",
+        )
+    )
+    return not any_allowlist and not allow_all
+
+
 def _normalize_whatsapp_identifier(value: str) -> str:
     """Strip WhatsApp JID/LID syntax down to its stable numeric identifier."""
     return (
@@ -1070,32 +1148,10 @@ class GatewayRunner:
         except Exception:
             pass
         
-        # Warn if no user allowlists are configured and open access is not opted in
-        _any_allowlist = any(
-            os.getenv(v)
-            for v in ("TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS",
-                       "WHATSAPP_ALLOWED_USERS", "SLACK_ALLOWED_USERS",
-                       "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
-                       "EMAIL_ALLOWED_USERS",
-                       "SMS_ALLOWED_USERS", "MATTERMOST_ALLOWED_USERS",
-                       "MATRIX_ALLOWED_USERS", "DINGTALK_ALLOWED_USERS",
-                       "FEISHU_ALLOWED_USERS",
-                       "WECOM_ALLOWED_USERS",
-                       "BLUEBUBBLES_ALLOWED_USERS",
-                       "GATEWAY_ALLOWED_USERS")
-        )
-        _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
-            os.getenv(v, "").lower() in ("true", "1", "yes")
-            for v in ("TELEGRAM_ALLOW_ALL_USERS", "DISCORD_ALLOW_ALL_USERS",
-                       "WHATSAPP_ALLOW_ALL_USERS", "SLACK_ALLOW_ALL_USERS",
-                       "SIGNAL_ALLOW_ALL_USERS", "EMAIL_ALLOW_ALL_USERS",
-                       "SMS_ALLOW_ALL_USERS", "MATTERMOST_ALLOW_ALL_USERS",
-                       "MATRIX_ALLOW_ALL_USERS", "DINGTALK_ALLOW_ALL_USERS",
-                       "FEISHU_ALLOW_ALL_USERS",
-                       "WECOM_ALLOW_ALL_USERS",
-                       "BLUEBUBBLES_ALLOW_ALL_USERS")
-        )
-        if not _any_allowlist and not _allow_all:
+        # Warn if enabled user-facing platforms have no allowlists and open
+        # access was not opted in. Local-only transports like api_server and
+        # webhook should not trigger this warning.
+        if should_warn_missing_allowlists(self.config):
             logger.warning(
                 "No user allowlists configured. All unauthorized users will be denied. "
                 "Set GATEWAY_ALLOW_ALL_USERS=true in ~/.hermes/.env to allow open access, "
