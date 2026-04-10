@@ -4615,7 +4615,7 @@ For more help on a command:
         "--poll-interval",
         type=float,
         default=30.0,
-        help="Auto-refresh interval in seconds for the kitty token-burn meter (0 disables auto polling)",
+        help="Auto-refresh interval in seconds for full-pool polling in auth view (0 disables auto polling)",
     )
     auth_view.add_argument("--smoke-test", action="store_true", help="Print a non-interactive snapshot instead of launching curses")
     auth_remove=auth_subparsers.add_parser("remove", help="Remove a pooled credential by index, id, or label")

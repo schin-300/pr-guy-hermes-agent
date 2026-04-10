@@ -88,11 +88,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
     CommandDef("model", "Switch model for this session", "Configuration", args_hint="[model] [--global]"),
-    CommandDef("context-limit", "Set or toggle the current session context window", "Configuration",
-               cli_only=True, args_hint="[tokens]"),
+    CommandDef("context-mode", "Switch between named session context profiles", "Configuration",
+               cli_only=True, args_hint="[1m|272k|status]"),
     CommandDef("provider", "Show available providers and current provider",
                "Configuration"),
     CommandDef("fast", "Toggle Codex fast mode", "Configuration",
+               args_hint="[on|off|status]", subcommands=FAST_MODE_SUBCOMMANDS,
+               busy_behavior="live"),
+    CommandDef("fast-temp", "Toggle Codex fast mode without saving to config", "Configuration",
                args_hint="[on|off|status]", subcommands=FAST_MODE_SUBCOMMANDS,
                busy_behavior="live"),
     CommandDef("prompt", "View/set custom system prompt", "Configuration",
@@ -151,7 +154,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
 
     # Exit
     CommandDef("quit", "Exit the CLI", "Exit",
-               cli_only=True, aliases=("exit", "q")),
+               cli_only=True, aliases=("exit",)),
 ]
 
 

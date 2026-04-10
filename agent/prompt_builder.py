@@ -179,6 +179,13 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities."
 )
 
+TODO_GUIDANCE = (
+    "The todo/plan tool is optional and adds token overhead. Prefer working directly "
+    "unless the user explicitly asks for a plan/todo or agrees after you ask. "
+    "Before creating or replacing a todo list, ask whether they want one; if they "
+    "decline, continue without using the todo tool."
+)
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "

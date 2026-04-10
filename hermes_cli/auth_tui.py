@@ -48,14 +48,12 @@ USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 WEEKLY_RESET_GAP_SECONDS = 3 * 24 * 60 * 60
 MAX_POLL_WORKERS = 8
 AUTO_REFRESH_INTERVAL_SECONDS = 30.0
-FULL_POOL_REFRESH_INTERVAL_SECONDS = 60.0
 AUTO_REFRESH_INTERVAL_PRESETS = (30.0, 15.0, 10.0, 5.0, 2.5, 0.0, 60.0, 120.0)
 KITTY_METER_MIN_WIDTH = 96
 KITTY_METER_MIN_HEIGHT = 20
 MAX_POOL_DRAIN_SAMPLES = 64
 MAX_VISIBLE_POOL_DRAIN_POLLS = 30
 REFRESH_SCOPE_ALL = "all"
-REFRESH_SCOPE_AVAILABLE = "available"
 _KITTY_PLACEHOLDER = "\U0010EEEE"
 _KITTY_CHUNK_SIZE = 4096
 _DEFAULT_CELL_PIXELS = (10, 20)
@@ -593,7 +591,7 @@ def _render_pool_drain_meter(
         stat1 = _meter_text_line(width, "warming up — waiting for two live polls")
         stat2 = _meter_text_line(
             width,
-            f"drain n/a  •  drop n/a  •  auto {poll_interval_text} avail / {int(FULL_POOL_REFRESH_INTERVAL_SECONDS)}s all",
+            f"drain n/a  •  drop n/a  •  auto {poll_interval_text} all",
         )
         graph_height = max(1, height - 4)
         graph_lines = [_meter_text_line(width, "·" * max(1, width - 6)) for _ in range(graph_height)]
@@ -607,7 +605,7 @@ def _render_pool_drain_meter(
         width,
         (
             f"avg left {latest.average_available_percent:.0f}%  •  {visible_polls}/{MAX_VISIBLE_POOL_DRAIN_POLLS} polls  •  "
-            f"auto {poll_interval_text} avail / {int(FULL_POOL_REFRESH_INTERVAL_SECONDS)}s all"
+            f"auto {poll_interval_text} all"
         ),
     )
 
@@ -1396,31 +1394,6 @@ def build_codex_profile_snapshots(
     return _sort_codex_profile_snapshots(snapshots)
 
 
-def _merge_codex_profile_snapshots(
-    existing_snapshots: list[CodexProfileSnapshot],
-    refreshed_snapshots: list[CodexProfileSnapshot],
-) -> list[CodexProfileSnapshot]:
-    if not existing_snapshots:
-        return list(refreshed_snapshots)
-    merged_by_id = {snapshot.entry_id: snapshot for snapshot in existing_snapshots}
-    for snapshot in refreshed_snapshots:
-        merged_by_id[snapshot.entry_id] = snapshot
-    merged: list[CodexProfileSnapshot] = []
-    seen_entry_ids: set[str] = set()
-    for snapshot in existing_snapshots:
-        current = merged_by_id.get(snapshot.entry_id)
-        if current is None or current.entry_id in seen_entry_ids:
-            continue
-        merged.append(current)
-        seen_entry_ids.add(current.entry_id)
-    for snapshot in refreshed_snapshots:
-        if snapshot.entry_id in seen_entry_ids:
-            continue
-        merged.append(snapshot)
-        seen_entry_ids.add(snapshot.entry_id)
-    return merged
-
-
 def build_codex_profile_placeholders(provider: str = DEFAULT_PROVIDER) -> list[CodexProfileSnapshot]:
     if provider != DEFAULT_PROVIDER:
         raise SystemExit(f"Auth view currently supports only {DEFAULT_PROVIDER}.")
@@ -1482,7 +1455,6 @@ class CodexAuthTui:
         self._last_primary_available: dict[str, tuple[float, Optional[int]]] = {}
         self._last_primary_capture_at: Optional[float] = None
         self._next_auto_refresh_at = 0.0
-        self._next_full_refresh_at = 0.0
         self._kitty_image_id = next(_KITTY_IMAGE_IDS) & 0xFFFFFF
         self._last_kitty_graph_signature: Optional[tuple[Any, ...]] = None
 
@@ -1504,8 +1476,6 @@ class CodexAuthTui:
             self.loading = True
             if initial:
                 self.message = "Polling live Codex profiles..."
-            elif refresh_scope == REFRESH_SCOPE_AVAILABLE:
-                self.message = "Refreshing available Codex profiles..."
             else:
                 self.message = "Refreshing Codex profiles..."
             self._remove_confirm_entry_id = None
@@ -1514,21 +1484,12 @@ class CodexAuthTui:
             self._selected_entry_id = selected.entry_id if selected else None
             return generation
 
-    def _available_entry_ids_unlocked(self) -> set[str]:
-        return {
-            snapshot.entry_id
-            for snapshot in self.snapshots
-            if snapshot.auth_badge == "OK" and snapshot.state == STATE_AVAILABLE
-        }
-
     def _auto_refresh_scope_at(self, now: float) -> Optional[str]:
         with self._lock:
             if not self.kitty_meter_enabled or self.loading:
                 return None
-            if self._next_full_refresh_at > 0 and now >= self._next_full_refresh_at:
-                return REFRESH_SCOPE_ALL
             if self.auto_refresh_interval_seconds > 0 and self._next_auto_refresh_at > 0 and now >= self._next_auto_refresh_at:
-                return REFRESH_SCOPE_AVAILABLE
+                return REFRESH_SCOPE_ALL
         return None
 
     def _fetch_live_snapshots(
@@ -1537,28 +1498,6 @@ class CodexAuthTui:
         refresh_scope: str = REFRESH_SCOPE_ALL,
     ) -> tuple[list[CodexProfileSnapshot], str, str]:
         try:
-            if refresh_scope == REFRESH_SCOPE_AVAILABLE:
-                with self._lock:
-                    existing_snapshots = list(self.snapshots)
-                    available_entry_ids = self._available_entry_ids_unlocked()
-                if not available_entry_ids:
-                    return (
-                        existing_snapshots,
-                        f"No available Codex profiles to poll. All accounts refresh every {int(FULL_POOL_REFRESH_INTERVAL_SECONDS)}s.",
-                        REFRESH_SCOPE_AVAILABLE,
-                    )
-                refreshed_snapshots = build_codex_profile_snapshots(
-                    provider=self.provider,
-                    timeout_seconds=self.timeout_seconds,
-                    entry_ids=available_entry_ids,
-                )
-                snapshots = _merge_codex_profile_snapshots(existing_snapshots, refreshed_snapshots)
-                message = (
-                    f"Updated {len(refreshed_snapshots)} available Codex profile{'s' if len(refreshed_snapshots) != 1 else ''}. "
-                    f"All accounts refresh every {int(FULL_POOL_REFRESH_INTERVAL_SECONDS)}s."
-                )
-                return snapshots, message, REFRESH_SCOPE_AVAILABLE
-
             snapshots = build_codex_profile_snapshots(
                 provider=self.provider,
                 timeout_seconds=self.timeout_seconds,
@@ -1570,12 +1509,8 @@ class CodexAuthTui:
             )
             return snapshots, message, REFRESH_SCOPE_ALL
         except Exception as exc:
-            snapshots = []
-            if refresh_scope == REFRESH_SCOPE_AVAILABLE:
-                with self._lock:
-                    snapshots = list(self.snapshots)
             message = f"Refresh failed: {exc}"
-            return snapshots, message, refresh_scope
+            return [], message, REFRESH_SCOPE_ALL
 
     def _apply_sort_mode(self, snapshots: list[CodexProfileSnapshot], mode: Optional[str] = None) -> list[CodexProfileSnapshot]:
         return _sort_codex_profile_snapshots(snapshots, mode=mode or self.sort_mode)
@@ -1607,12 +1542,7 @@ class CodexAuthTui:
                 self._next_auto_refresh_at = now + next_interval
             else:
                 self._next_auto_refresh_at = 0.0
-            if self._next_full_refresh_at <= 0:
-                self._next_full_refresh_at = now + FULL_POOL_REFRESH_INTERVAL_SECONDS
-            self.message = (
-                f"Auto refresh {_format_poll_interval_seconds(next_interval)} for available accounts; "
-                f"all accounts every {int(FULL_POOL_REFRESH_INTERVAL_SECONDS)}s."
-            )
+            self.message = f"Auto refresh set to {_format_poll_interval_seconds(next_interval)} for all Codex profiles."
 
     def _finish_refresh(
         self,
@@ -1646,23 +1576,10 @@ class CodexAuthTui:
                     self._next_auto_refresh_at = captured_at + self.auto_refresh_interval_seconds
                 else:
                     self._next_auto_refresh_at = 0.0
-                if refresh_scope == REFRESH_SCOPE_ALL or self._next_full_refresh_at <= 0:
-                    self._next_full_refresh_at = captured_at + FULL_POOL_REFRESH_INTERVAL_SECONDS
             selected = self._selected_snapshot_unlocked()
             self._selected_entry_id = selected.entry_id if selected else None
 
     def _refresh_async(self, *, refresh_scope: str = REFRESH_SCOPE_ALL) -> None:
-        if refresh_scope == REFRESH_SCOPE_AVAILABLE:
-            with self._lock:
-                if not self._available_entry_ids_unlocked():
-                    now = time.time()
-                    if self._next_full_refresh_at <= 0:
-                        self._next_full_refresh_at = now + FULL_POOL_REFRESH_INTERVAL_SECONDS
-                    self._next_auto_refresh_at = self._next_full_refresh_at
-                    self.message = (
-                        f"No available Codex profiles to poll. All accounts refresh every {int(FULL_POOL_REFRESH_INTERVAL_SECONDS)}s."
-                    )
-                    return
         generation = self._start_refresh(show_placeholders=not self.snapshots, refresh_scope=refresh_scope)
         thread = threading.Thread(target=self._refresh_worker, args=(generation, refresh_scope), daemon=True)
         thread.start()
@@ -1791,7 +1708,7 @@ class CodexAuthTui:
                 (
                     f"drain {latest.rate_percent_per_hour:.1f} pool-%/h  •  drop {latest.dropping_accounts}/{latest.compared_accounts}  •  "
                     f"avg left {latest.average_available_percent:.0f}%  •  {visible_polls}/{MAX_VISIBLE_POOL_DRAIN_POLLS} polls  •  "
-                    f"auto {_format_poll_interval_seconds(self.auto_refresh_interval_seconds)} avail / {int(FULL_POOL_REFRESH_INTERVAL_SECONDS)}s all"
+                    f"auto {_format_poll_interval_seconds(self.auto_refresh_interval_seconds)} all"
                 ),
                 width - 1,
             ),

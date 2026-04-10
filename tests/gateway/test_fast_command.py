@@ -73,12 +73,13 @@ class _CapturingAgent:
 
 class TestGatewayFastCommand:
     @pytest.mark.asyncio
-    async def test_help_output_lists_fast(self, tmp_path):
+    async def test_help_output_lists_fast_and_fast_temp(self, tmp_path):
         runner = _make_runner(tmp_path)
 
         result = await runner._handle_help_command(_make_event("/help"))
 
         assert "/fast [on|off|status]" in result
+        assert "/fast-temp [on|off|status]" in result
 
     @pytest.mark.asyncio
     async def test_handle_fast_command_sets_session_override(self, tmp_path):
@@ -89,6 +90,18 @@ class TestGatewayFastCommand:
         entry = runner.session_store.get_or_create_session(event.source)
 
         assert "takes effect on next message" in result
+        assert entry.service_tier_override == "fast"
+
+    @pytest.mark.asyncio
+    async def test_handle_fast_temp_command_sets_session_override(self, tmp_path):
+        runner = _make_runner(tmp_path)
+        event = _make_event("/fast-temp on")
+
+        result = await runner._handle_fast_temp_command(event)
+        entry = runner.session_store.get_or_create_session(event.source)
+
+        assert "takes effect on next message" in result
+        assert "not saved to config" in result
         assert entry.service_tier_override == "fast"
 
     def test_force_new_session_clears_fast_override(self, tmp_path):

@@ -375,6 +375,9 @@ class IterationBudget:
 # When any of these appear in a batch, we fall back to sequential execution.
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify", "attach_image"})
 
+TODO_OPT_IN_QUESTION = "Would you like me to make a plan/todo for this task?"
+TODO_OPT_IN_CHOICES = ["Yes — make a plan/todo", "No — work without one"]
+
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
     "ha_get_state",
@@ -1162,6 +1165,8 @@ class AIAgent:
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
         self._todo_store = TodoStore()
+        self._latest_user_message_text = ""
+        self._todo_write_opt_in: Optional[bool] = None
         
         # Load config once for memory, skills, and compression sections
         try:
@@ -1485,6 +1490,23 @@ class AIAgent:
             return self.context_length_override
         return getattr(self, "_config_context_length", None)
 
+    def _refresh_context_compressor_budgets(self) -> None:
+        if not hasattr(self, "context_compressor") or not self.context_compressor:
+            return
+
+        from agent import context_compressor as _context_compressor_mod
+
+        self.context_compressor.threshold_tokens = int(
+            self.context_compressor.context_length * self.context_compressor.threshold_percent
+        )
+        self.context_compressor.tail_token_budget = int(
+            self.context_compressor.threshold_tokens * self.context_compressor.summary_target_ratio
+        )
+        self.context_compressor.max_summary_tokens = min(
+            int(self.context_compressor.context_length * 0.05),
+            _context_compressor_mod._SUMMARY_TOKENS_CEILING,
+        )
+
     def _refresh_context_compressor_context_length(self) -> int | None:
         if not hasattr(self, "context_compressor") or not self.context_compressor:
             return None
@@ -1503,24 +1525,41 @@ class AIAgent:
         self.context_compressor.api_key = getattr(self, "api_key", "")
         self.context_compressor.provider = self.provider
         self.context_compressor.context_length = new_context_length
-        self.context_compressor.threshold_tokens = int(
-            new_context_length * self.context_compressor.threshold_percent
-        )
+        self._refresh_context_compressor_budgets()
         return new_context_length
 
-    def set_context_length_override(self, context_length: int | None) -> int:
-        self.context_length_override = int(context_length) if context_length else None
+    def _update_primary_runtime_context_profile(self, refreshed: int | None) -> None:
+        if not (hasattr(self, "_primary_runtime") and isinstance(self._primary_runtime, dict) and refreshed):
+            return
+        self._primary_runtime.update({
+            "compressor_model": self.context_compressor.model,
+            "compressor_base_url": self.context_compressor.base_url,
+            "compressor_api_key": getattr(self.context_compressor, "api_key", ""),
+            "compressor_provider": self.context_compressor.provider,
+            "compressor_context_length": refreshed,
+            "compressor_threshold_percent": self.context_compressor.threshold_percent,
+            "compressor_threshold_tokens": self.context_compressor.threshold_tokens,
+        })
+
+    def set_context_profile(
+        self,
+        *,
+        context_length: int | None = None,
+        compression_threshold: float | None = None,
+    ) -> int:
+        if context_length is not None:
+            self.context_length_override = int(context_length) if context_length else None
+        if compression_threshold is not None and hasattr(self, "context_compressor") and self.context_compressor:
+            self.context_compressor.threshold_percent = float(compression_threshold)
+
         refreshed = self._refresh_context_compressor_context_length()
-        if hasattr(self, "_primary_runtime") and isinstance(self._primary_runtime, dict) and refreshed:
-            self._primary_runtime.update({
-                "compressor_model": self.context_compressor.model,
-                "compressor_base_url": self.context_compressor.base_url,
-                "compressor_api_key": getattr(self.context_compressor, "api_key", ""),
-                "compressor_provider": self.context_compressor.provider,
-                "compressor_context_length": refreshed,
-                "compressor_threshold_tokens": self.context_compressor.threshold_tokens,
-            })
+        if refreshed and compression_threshold is not None:
+            self._refresh_context_compressor_budgets()
+        self._update_primary_runtime_context_profile(refreshed)
         return refreshed or 0
+
+    def set_context_length_override(self, context_length: int | None) -> int:
+        return self.set_context_profile(context_length=context_length)
     
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Switch the model/provider in-place for a live agent.
@@ -2981,6 +3020,9 @@ class AIAgent:
             tool_guidance.append(MEMORY_GUIDANCE)
         if "session_search" in self.valid_tool_names:
             tool_guidance.append(SESSION_SEARCH_GUIDANCE)
+        if "todo" in self.valid_tool_names:
+            from agent.prompt_builder import TODO_GUIDANCE
+            tool_guidance.append(TODO_GUIDANCE)
         if "hermes_docs_lookup" in self.valid_tool_names:
             tool_guidance.append(HERMES_DOCS_LOOKUP_GUIDANCE)
         if "skill_manage" in self.valid_tool_names:
@@ -3380,6 +3422,425 @@ class AIAgent:
         self._cached_system_prompt = None
         if self._memory_store:
             self._memory_store.load_from_disk()
+
+    def _mirror_builtin_memory_write(self, action: str, target: str, content: str) -> None:
+        if not self._memory_manager or action not in ("add", "replace"):
+            return
+        try:
+            self._memory_manager.on_memory_write(action, target, content)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _memory_compaction_response_is_approval(user_response: str) -> bool:
+        lowered = (user_response or "").strip().lower()
+        if not lowered:
+            return False
+        approval_markers = (
+            "apply proposed compaction",
+            "approve",
+            "approved",
+            "apply",
+            "yes",
+            "yep",
+            "go ahead",
+            "do it",
+            "compact",
+            "prune",
+            "auto",
+            "default",
+        )
+        decline_markers = (
+            "skip",
+            "no",
+            "don't",
+            "do not",
+            "leave",
+            "unchanged",
+            "cancel",
+            "later",
+        )
+        if any(marker in lowered for marker in decline_markers):
+            return False
+        return any(marker in lowered for marker in approval_markers)
+
+    @staticmethod
+    def _memory_compaction_response_requests_more_detail(user_response: str) -> bool:
+        lowered = (user_response or "").strip().lower()
+        if not lowered:
+            return False
+        detail_markers = (
+            "show exact entries again / more detail",
+            "show exact entries",
+            "more detail",
+            "details",
+            "show more",
+            "show proposal",
+            "show diff",
+            "view diff",
+        )
+        return any(marker in lowered for marker in detail_markers)
+
+    @staticmethod
+    def _memory_compaction_response_requests_open_text(user_response: str) -> bool:
+        lowered = (user_response or "").strip().lower()
+        if not lowered:
+            return False
+        markers = (
+            "let me answer in my own words",
+            "my own words",
+            "i'll type",
+            "i will type",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @staticmethod
+    def _memory_compaction_response_is_decline(user_response: str) -> bool:
+        lowered = (user_response or "").strip().lower()
+        if not lowered:
+            return False
+        decline_markers = (
+            "skip",
+            "no",
+            "don't",
+            "do not",
+            "leave",
+            "unchanged",
+            "cancel",
+            "later",
+        )
+        return any(marker in lowered for marker in decline_markers)
+
+    @staticmethod
+    def _memory_compaction_extract_selected_group_ids(user_response: str, valid_ids: List[int]) -> List[int]:
+        lowered = (user_response or "").strip().lower()
+        if not lowered or "detail" in lowered or "show" in lowered:
+            return []
+        valid = {int(group_id) for group_id in valid_ids}
+        found = []
+        for match in re.findall(r"\b(\d+)\b", lowered):
+            group_id = int(match)
+            if group_id in valid and group_id not in found:
+                found.append(group_id)
+        return found
+
+    @staticmethod
+    def _memory_compaction_extract_detail_group_ids(user_response: str, valid_ids: List[int]) -> List[int]:
+        if not AIAgent._memory_compaction_response_requests_more_detail(user_response):
+            return []
+        valid = {int(group_id) for group_id in valid_ids}
+        found = []
+        for match in re.findall(r"\b(\d+)\b", (user_response or "").strip().lower()):
+            group_id = int(match)
+            if group_id in valid and group_id not in found:
+                found.append(group_id)
+        return found or list(valid_ids)
+
+    @staticmethod
+    def _build_memory_compaction_question(
+        target: str,
+        proposal: Dict[str, Any],
+        *,
+        include_entry_details: bool = False,
+        detail_group_ids: Optional[List[int]] = None,
+    ) -> str:
+        """Build an approval prompt for built-in memory compaction."""
+        target_label = "USER PROFILE" if target == "user" else "MEMORY"
+        candidates = proposal.get("candidates", []) or []
+        topic_groups = proposal.get("topic_groups", []) or []
+        limit = int(proposal.get("limit", 0) or 0)
+        current_usage = int(proposal.get("current_usage", 0) or 0)
+        projected_after_write = int(proposal.get("projected_after_write", current_usage) or current_usage)
+        required_chars = int(proposal.get("required_chars", 0) or 0)
+        target_chars_to_free = int(proposal.get("target_chars_to_free", 0) or 0)
+        freed_chars = int(proposal.get("freed_chars", 0) or 0)
+        estimated_retry = int(proposal.get("estimated_usage_after_retry", 0) or 0)
+        max_candidates = 4
+
+        lines = [
+            f"Built-in {target_label} is full ({current_usage:,}/{limit:,} chars).",
+            f"Retrying this write would land at about {projected_after_write:,}/{limit:,} chars.",
+        ]
+
+        if topic_groups:
+            lines.append("Possible topic deletions:")
+            requested_ids = {int(group_id) for group_id in (detail_group_ids or [])}
+            visible_groups = topic_groups
+            if include_entry_details and requested_ids:
+                visible_groups = [
+                    group for group in topic_groups
+                    if int(group.get("id", 0) or 0) in requested_ids
+                ] or topic_groups
+            elif not include_entry_details:
+                visible_groups = topic_groups[:max_candidates]
+
+            for group in visible_groups:
+                group_id = int(group.get("id", 0) or 0)
+                topic = group.get("topic", "memory")
+                entry_count = int(group.get("entry_count", 0) or 0)
+                chars_freed = int(group.get("chars_freed_if_removed", 0) or 0)
+                lines.append(f"{group_id}. [{topic}] ({entry_count} entr{'y' if entry_count == 1 else 'ies'}, ~{chars_freed} chars)")
+
+            remaining = len(topic_groups) - len(visible_groups)
+            if remaining > 0 and not include_entry_details:
+                lines.append(f"...and {remaining} more topic group(s).")
+
+            if required_chars > 0:
+                lines.append(f"Need to free about {required_chars:,} chars to fit, aiming for ~{target_chars_to_free:,} chars of room.")
+            lines.append(f"After deletion + retry: about {estimated_retry:,}/{limit:,} chars if you choose enough topics.")
+            if include_entry_details:
+                lines.append("")
+                lines.append("Topic details:")
+                for group in visible_groups:
+                    group_id = int(group.get("id", 0) or 0)
+                    topic = group.get("topic", "memory")
+                    entry_count = int(group.get("entry_count", 0) or 0)
+                    chars_freed = int(group.get("chars_freed_if_removed", 0) or 0)
+                    lines.append(f"{group_id}. [{topic}] ({entry_count} entr{'y' if entry_count == 1 else 'ies'}, ~{chars_freed} chars)")
+                    reason = str(group.get("reason", "") or "").strip()
+                    if reason:
+                        lines.append(f"   why:  {reason}")
+                    for entry in group.get("entries", []) or []:
+                        lines.append(f"   - {str(entry).strip()}")
+            lines.append("Type topic number(s) to delete (example: 1 or 1,3), type \"details 1\" to inspect exact entries, type \"auto\" to use Hermes's default compaction, or type \"skip\".")
+            return "\n".join(lines)
+
+        lines.append("Proposed compaction:")
+        for idx, candidate in enumerate(candidates[:max_candidates], start=1):
+            kind = candidate.get("kind", "change")
+            topic = candidate.get("topic", "memory")
+            saved = int(candidate.get("chars_saved", 0) or 0)
+            lines.append(f"{idx}. {kind} [{topic}] (~{saved} chars)")
+
+        remaining = len(candidates) - max_candidates
+        if remaining > 0:
+            lines.append(f"...and {remaining} more suggested change(s).")
+
+        if required_chars > 0:
+            lines.append(f"Need to free about {required_chars:,} chars to fit, aiming for ~{target_chars_to_free:,} chars of room.")
+        if freed_chars > 0:
+            lines.append(f"Selected changes would free about {freed_chars:,} chars.")
+
+        if include_entry_details and candidates:
+            lines.append("")
+            lines.append("Full proposed changes:")
+            for idx, candidate in enumerate(candidates, start=1):
+                kind = candidate.get("kind", "change")
+                topic = candidate.get("topic", "memory")
+                saved = int(candidate.get("chars_saved", 0) or 0)
+                reason = candidate.get("reason", "")
+                old_entry = str(candidate.get("old_entry", "") or "").strip()
+                new_entry = str(candidate.get("new_entry", "") or "").strip()
+                lines.append(f"{idx}. {kind} [{topic}] (~{saved} chars)")
+                if reason:
+                    lines.append(f"   why:  {reason}")
+                if kind == "shorten":
+                    lines.append(f"   from: {old_entry}")
+                    lines.append(f"   to:   {new_entry}")
+                elif kind == "remove":
+                    lines.append(f"   remove: {old_entry}")
+
+        lines.append(f"After compaction + retry: about {estimated_retry:,}/{limit:,} chars.")
+        lines.append("Approve to apply it now and retry saving this memory.")
+        return "\n".join(lines)
+
+    def _handle_builtin_memory_tool(self, function_args: Dict[str, Any]) -> str:
+        from tools.memory_tool import memory_tool as _memory_tool
+
+        action = function_args.get("action")
+        target = function_args.get("target", "memory")
+        raw_result = _memory_tool(
+            action=action,
+            target=target,
+            content=function_args.get("content"),
+            old_text=function_args.get("old_text"),
+            store=self._memory_store,
+        )
+
+        try:
+            parsed = json.loads(raw_result)
+        except Exception:
+            return raw_result
+
+        if parsed.get("success"):
+            self._mirror_builtin_memory_write(action or "", target, function_args.get("content", ""))
+            return raw_result
+
+        if action not in ("add", "replace") or not self._memory_store:
+            return raw_result
+
+        proposal = self._memory_store.build_compaction_proposal(
+            target,
+            function_args.get("content", ""),
+            action=action,
+            old_text=function_args.get("old_text"),
+        )
+        parsed["compaction_proposal"] = proposal
+
+        if not proposal.get("candidates") and not proposal.get("topic_groups"):
+            parsed.setdefault("message", "Built-in memory is full and no compaction proposal was available.")
+            return json.dumps(parsed, ensure_ascii=False)
+
+        if not proposal.get("can_make_room") and not proposal.get("topic_groups"):
+            parsed.setdefault("message", "Built-in memory is full and the proposed compaction would still not make enough room.")
+            return json.dumps(parsed, ensure_ascii=False)
+
+        if not self.clarify_callback:
+            parsed["approval_required"] = True
+            parsed.setdefault("message", "Built-in memory is full. Approval is required before compaction.")
+            return json.dumps(parsed, ensure_ascii=False)
+
+        from tools.clarify_tool import clarify_tool as _clarify_tool
+
+        user_response = ""
+        applied_proposal = proposal
+        question = self._build_memory_compaction_question(target, proposal)
+        attempts = 0
+        topic_groups = proposal.get("topic_groups", []) or []
+        valid_group_ids = [
+            int(group.get("id"))
+            for group in topic_groups
+            if str(group.get("id", "")).isdigit()
+        ]
+
+        if valid_group_ids:
+            while True:
+                attempts += 1
+                clarify_raw = _clarify_tool(
+                    question=question,
+                    choices=None,
+                    callback=self.clarify_callback,
+                )
+                try:
+                    clarify_result = json.loads(clarify_raw)
+                except Exception:
+                    clarify_result = {"user_response": ""}
+
+                user_response = clarify_result.get("user_response", "")
+                if self._memory_compaction_response_is_decline(user_response):
+                    parsed["compaction_declined"] = True
+                    parsed["approval_required"] = False
+                    parsed["user_response"] = user_response
+                    parsed.setdefault("message", "Built-in memory is full and the proposed compaction was not approved.")
+                    return json.dumps(parsed, ensure_ascii=False)
+
+                detail_group_ids = self._memory_compaction_extract_detail_group_ids(user_response, valid_group_ids)
+                if detail_group_ids:
+                    question = self._build_memory_compaction_question(
+                        target,
+                        proposal,
+                        include_entry_details=True,
+                        detail_group_ids=detail_group_ids,
+                    )
+                    if attempts < 5:
+                        continue
+
+                selected_group_ids = self._memory_compaction_extract_selected_group_ids(user_response, valid_group_ids)
+                if selected_group_ids:
+                    selected_proposal = self._memory_store.build_topic_group_selection_proposal(target, proposal, selected_group_ids)
+                    if selected_proposal.get("success") and selected_proposal.get("can_make_room"):
+                        applied_proposal = selected_proposal
+                        break
+                    freed_chars = int(selected_proposal.get("freed_chars", 0) or 0)
+                    estimated_retry = int(selected_proposal.get("estimated_usage_after_retry", proposal.get("projected_after_write", 0)) or 0)
+                    limit = int(selected_proposal.get("limit", proposal.get("limit", 0)) or 0)
+                    shortfall = max(0, estimated_retry - limit)
+                    question = (
+                        f"That selection would free about {freed_chars:,} chars and is still short by about {shortfall:,}. Pick additional topic numbers, ask for details, type auto, or type skip.\n\n"
+                        + self._build_memory_compaction_question(target, proposal)
+                    )
+                    if attempts < 5:
+                        continue
+
+                if self._memory_compaction_response_is_approval(user_response):
+                    applied_proposal = proposal
+                    break
+
+                question = (
+                    "I didn't understand that. Reply with topic numbers like 1 or 1,3; type details 1; type auto; or type skip.\n\n"
+                    + self._build_memory_compaction_question(target, proposal)
+                )
+                if attempts < 5:
+                    continue
+
+                parsed["compaction_declined"] = True
+                parsed["approval_required"] = False
+                parsed["user_response"] = user_response
+                parsed.setdefault("message", "Built-in memory is full and the proposed compaction was not approved.")
+                return json.dumps(parsed, ensure_ascii=False)
+        else:
+            choices = [
+                "Apply proposed compaction",
+                "Show exact entries again / more detail",
+                "Skip saving this memory",
+                "Let me answer in my own words",
+            ]
+            while True:
+                attempts += 1
+                clarify_raw = _clarify_tool(
+                    question=question,
+                    choices=choices,
+                    callback=self.clarify_callback,
+                )
+                try:
+                    clarify_result = json.loads(clarify_raw)
+                except Exception:
+                    clarify_result = {"user_response": ""}
+
+                user_response = clarify_result.get("user_response", "")
+                if self._memory_compaction_response_is_approval(user_response):
+                    break
+                if self._memory_compaction_response_requests_more_detail(user_response):
+                    question = self._build_memory_compaction_question(target, proposal, include_entry_details=True)
+                    choices = [
+                        "Apply proposed compaction",
+                        "Skip saving this memory",
+                        "Let me answer in my own words",
+                    ]
+                    if attempts < 3:
+                        continue
+                if self._memory_compaction_response_requests_open_text(user_response):
+                    question = self._build_memory_compaction_question(target, proposal, include_entry_details=True)
+                    choices = None
+                    if attempts < 3:
+                        continue
+
+                parsed["compaction_declined"] = True
+                parsed["approval_required"] = False
+                parsed["user_response"] = user_response
+                parsed.setdefault("message", "Built-in memory is full and the proposed compaction was not approved.")
+                return json.dumps(parsed, ensure_ascii=False)
+
+        apply_result = self._memory_store.apply_compaction_proposal(target, applied_proposal)
+        if not apply_result.get("success"):
+            parsed["compaction_failed"] = True
+            parsed["compaction_apply_result"] = apply_result
+            parsed.setdefault("message", "Built-in memory compaction failed before the retry could run.")
+            return json.dumps(parsed, ensure_ascii=False)
+
+        retry_raw = _memory_tool(
+            action=action,
+            target=target,
+            content=function_args.get("content"),
+            old_text=function_args.get("old_text"),
+            store=self._memory_store,
+        )
+        try:
+            retry_result = json.loads(retry_raw)
+        except Exception:
+            return retry_raw
+
+        retry_result["compaction"] = {
+            "approved": True,
+            "user_response": user_response,
+            "proposal": applied_proposal,
+            "applied": apply_result.get("compaction_applied", []),
+        }
+
+        if retry_result.get("success"):
+            self._mirror_builtin_memory_write(action or "", target, function_args.get("content", ""))
+
+        return json.dumps(retry_result, ensure_ascii=False)
 
     def _responses_tools(self, tools: Optional[List[Dict[str, Any]]] = None) -> Optional[List[Dict[str, Any]]]:
         """Convert chat-completions tool schemas to Responses function-tool schemas."""
@@ -6502,16 +6963,9 @@ class AIAgent:
                 if tc.function.name == "memory":
                     try:
                         args = json.loads(tc.function.arguments)
-                        flush_target = args.get("target", "memory")
-                        from tools.memory_tool import memory_tool as _memory_tool
-                        _memory_tool(
-                            action=args.get("action"),
-                            target=flush_target,
-                            content=args.get("content"),
-                            old_text=args.get("old_text"),
-                            store=self._memory_store,
-                        )
-                        if not self.quiet_mode:
+                        flush_result = self._handle_builtin_memory_tool(args)
+                        flush_parsed = json.loads(flush_result)
+                        if flush_parsed.get("success") and not self.quiet_mode:
                             print(f"  🧠 Memory flush: saved to {args.get('target', 'memory')}")
                     except Exception as e:
                         logger.debug("Memory flush tool call failed: %s", e)
@@ -6658,6 +7112,86 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
+    def _latest_user_message_requests_todo(self) -> bool:
+        text = str(getattr(self, "_latest_user_message_text", "") or "").strip().lower()
+        if not text:
+            return False
+        if "/plan" in text:
+            return True
+        if re.search(r"\b(?:no|without|dont|don't|skip|avoid)\b.{0,24}\b(?:plan|todo|task list|checklist)\b", text):
+            return False
+        request_patterns = (
+            r"\b(?:make|create|add|build|use|give|show|draft|write)\b.{0,32}\b(?:plan|todo|task list|checklist)\b",
+            r"\b(?:plan|todo|task list|checklist)\b.{0,24}\b(?:please|first|now|for this)\b",
+        )
+        return any(re.search(pattern, text) for pattern in request_patterns)
+
+    @staticmethod
+    def _todo_opt_in_response_is_approval(response: str) -> bool:
+        return str(response or "").strip().lower().startswith("yes")
+
+    @staticmethod
+    def _todo_opt_in_response_is_decline(response: str) -> bool:
+        return str(response or "").strip().lower().startswith("no")
+
+    def _todo_write_requires_opt_in(self, function_args: Dict[str, Any]) -> bool:
+        todos = function_args.get("todos")
+        if todos is None:
+            return False
+        if self._todo_store.has_active_items():
+            return False
+        if self._todo_write_opt_in is True:
+            return False
+        if self._latest_user_message_requests_todo():
+            return False
+        return True
+
+    def _todo_opt_in_error(self) -> str:
+        return json.dumps(
+            {
+                "error": (
+                    "Before creating a new plan/todo, ask the user whether they want one. "
+                    "Use clarify if helpful, or proceed without a plan if they decline."
+                ),
+                "approval_required": True,
+                "question": TODO_OPT_IN_QUESTION,
+                "choices": TODO_OPT_IN_CHOICES,
+            },
+            ensure_ascii=False,
+        )
+
+    def _invoke_todo_tool(self, function_args: Dict[str, Any]) -> str:
+        if self._todo_write_requires_opt_in(function_args):
+            return self._todo_opt_in_error()
+        from tools.todo_tool import todo_tool as _todo_tool
+        return _todo_tool(
+            todos=function_args.get("todos"),
+            merge=function_args.get("merge", False),
+            store=self._todo_store,
+        )
+
+    def _invoke_clarify_tool(self, function_args: Dict[str, Any]) -> str:
+        from tools.clarify_tool import clarify_tool as _clarify_tool
+
+        result = _clarify_tool(
+            question=function_args.get("question", ""),
+            choices=function_args.get("choices"),
+            callback=self.clarify_callback,
+        )
+        try:
+            parsed = json.loads(result)
+        except Exception:
+            return result
+
+        question = str(parsed.get("question") or function_args.get("question") or "").strip()
+        if question == TODO_OPT_IN_QUESTION:
+            user_response = parsed.get("user_response", "")
+            if self._todo_opt_in_response_is_approval(user_response):
+                self._todo_write_opt_in = True
+            elif self._todo_opt_in_response_is_decline(user_response):
+                self._todo_write_opt_in = False
+        return result
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None) -> str:
         """Invoke a single tool and return the result string. No display logic.
@@ -6667,12 +7201,7 @@ class AIAgent:
         its own inline invocation for backward-compatible display handling.
         """
         if function_name == "todo":
-            from tools.todo_tool import todo_tool as _todo_tool
-            return _todo_tool(
-                todos=function_args.get("todos"),
-                merge=function_args.get("merge", False),
-                store=self._todo_store,
-            )
+            return self._invoke_todo_tool(function_args)
         elif function_name == "session_search":
             if not self._session_db:
                 return json.dumps({"success": False, "error": "Session database not available."})
@@ -6685,35 +7214,11 @@ class AIAgent:
                 current_session_id=self.session_id,
             )
         elif function_name == "memory":
-            target = function_args.get("target", "memory")
-            from tools.memory_tool import memory_tool as _memory_tool
-            result = _memory_tool(
-                action=function_args.get("action"),
-                target=target,
-                content=function_args.get("content"),
-                old_text=function_args.get("old_text"),
-                store=self._memory_store,
-            )
-            # Bridge: notify external memory provider of built-in memory writes
-            if self._memory_manager and function_args.get("action") in ("add", "replace"):
-                try:
-                    self._memory_manager.on_memory_write(
-                        function_args.get("action", ""),
-                        target,
-                        function_args.get("content", ""),
-                    )
-                except Exception:
-                    pass
-            return result
+            return self._handle_builtin_memory_tool(function_args)
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
             return self._memory_manager.handle_tool_call(function_name, function_args)
         elif function_name == "clarify":
-            from tools.clarify_tool import clarify_tool as _clarify_tool
-            return _clarify_tool(
-                question=function_args.get("question", ""),
-                choices=function_args.get("choices"),
-                callback=self.clarify_callback,
-            )
+            return self._invoke_clarify_tool(function_args)
         elif function_name == "delegate_task":
             from tools.delegate_tool import delegate_task as _delegate_task
             return _delegate_task(
@@ -7054,12 +7559,7 @@ class AIAgent:
             tool_start_time = time.time()
 
             if function_name == "todo":
-                from tools.todo_tool import todo_tool as _todo_tool
-                function_result = _todo_tool(
-                    todos=function_args.get("todos"),
-                    merge=function_args.get("merge", False),
-                    store=self._todo_store,
-                )
+                function_result = self._invoke_todo_tool(function_args)
                 tool_duration = time.time() - tool_start_time
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
@@ -7079,25 +7579,12 @@ class AIAgent:
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
-                target = function_args.get("target", "memory")
-                from tools.memory_tool import memory_tool as _memory_tool
-                function_result = _memory_tool(
-                    action=function_args.get("action"),
-                    target=target,
-                    content=function_args.get("content"),
-                    old_text=function_args.get("old_text"),
-                    store=self._memory_store,
-                )
+                function_result = self._handle_builtin_memory_tool(function_args)
                 tool_duration = time.time() - tool_start_time
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
             elif function_name == "clarify":
-                from tools.clarify_tool import clarify_tool as _clarify_tool
-                function_result = _clarify_tool(
-                    question=function_args.get("question", ""),
-                    choices=function_args.get("choices"),
-                    callback=self.clarify_callback,
-                )
+                function_result = self._invoke_clarify_tool(function_args)
                 tool_duration = time.time() - tool_start_time
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
@@ -7649,6 +8136,8 @@ class AIAgent:
         # Preserve the original user message (no nudge injection).
         original_user_message = persist_user_message if persist_user_message is not None else user_message
         original_user_message_text = message_content_to_text(original_user_message)
+        self._latest_user_message_text = original_user_message_text
+        self._todo_write_opt_in = None
 
         # Track memory nudge trigger (turn-based, checked here).
         # Skill trigger is checked AFTER the agent loop completes, based on

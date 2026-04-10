@@ -2,7 +2,7 @@
 
 import json
 
-from tools.todo_tool import TodoStore, todo_tool, build_todo_snapshot_message, TODO_SNAPSHOT_MARKER
+from tools.todo_tool import TODO_SNAPSHOT_MARKER, TodoStore, build_todo_snapshot_message, todo_tool
 
 
 class TestWriteAndRead:
@@ -24,7 +24,7 @@ class TestWriteAndRead:
         items[0]["content"] = "MUTATED"
         assert store.read()[0]["content"] == "Task"
 
-    def test_preserves_review_loop_metadata(self):
+    def test_normalizes_review_loop_compat_data_to_plain_task(self):
         store = TodoStore()
         store.write([
             {
@@ -34,14 +34,18 @@ class TestWriteAndRead:
                 "kind": "review_loop",
                 "success_criteria": "Popup persists edits.",
                 "reviewer_profile": "gpt-5.4 reviewer",
+                "reviewer_prompt": "Compare expected vs actual behavior",
                 "attempt_count": 2,
+                "parent_id": "outer",
             }
         ])
         item = store.read()[0]
-        assert item["kind"] == "review_loop"
-        assert item["success_criteria"] == "Popup persists edits."
-        assert item["reviewer_profile"] == "gpt-5.4 reviewer"
-        assert item["attempt_count"] == 2
+        assert item == {
+            "id": "review",
+            "content": "Review popup",
+            "status": "pending",
+            "kind": "task",
+        }
 
 
 class TestHasItems:
@@ -54,39 +58,35 @@ class TestHasItems:
         store.write([{"id": "1", "content": "x", "status": "pending"}])
         assert store.has_items() is True
 
+    def test_has_active_items(self):
+        store = TodoStore()
+        assert store.has_active_items() is False
+        store.write([{"id": "1", "content": "x", "status": "completed"}])
+        assert store.has_active_items() is False
+        store.write([{"id": "2", "content": "y", "status": "in_progress"}])
+        assert store.has_active_items() is True
+
 
 class TestFormatForInjection:
     def test_empty_returns_none(self):
         store = TodoStore()
         assert store.format_for_injection() is None
 
-    def test_non_empty_has_markers(self):
+    def test_non_empty_shows_plain_active_tasks_only(self):
         store = TodoStore()
         store.write([
-            {"id": "1", "content": "Do thing", "status": "completed"},
-            {
-                "id": "2",
-                "content": "Next",
-                "status": "pending",
-                "kind": "review_loop",
-                "success_criteria": "Popup passes review",
-                "reviewer_profile": "gpt-5.4 reviewer",
-            },
-            {"id": "3", "content": "Working", "status": "in_progress"},
+            {"id": "1", "content": "Completed thing", "status": "completed"},
+            {"id": "2", "content": "Queued task", "status": "pending"},
+            {"id": "3", "content": "Working", "status": "in_progress", "kind": "review_loop"},
         ])
         text = store.format_for_injection()
-        # Completed items are filtered out of injection
-        assert "[x]" not in text
-        assert "Do thing" not in text
-        # Active items are included
-        assert "[ ]" in text
-        assert "[>]" in text
-        assert "Next" in text
+        assert "Completed thing" not in text
+        assert "Queued task" in text
         assert "Working" in text
-        assert "review_loop" in text
-        assert "criteria: Popup passes review" in text
-        assert "reviewer: gpt-5.4 reviewer" in text
-        assert "context compression" in text.lower()
+        assert "review_loop" not in text
+        assert "Scratch-like" not in text
+        assert "- [ ] 2. Queued task" in text
+        assert "- [>] 3. Working" in text
 
 
 class TestMergeMode:

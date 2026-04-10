@@ -2081,6 +2081,9 @@ class GatewayRunner:
         if canonical == "fast":
             return await self._handle_fast_command(event)
 
+        if canonical == "fast-temp":
+            return await self._handle_fast_temp_command(event)
+
         if canonical == "verbose":
             return await self._handle_verbose_command(event)
 
@@ -4839,13 +4842,19 @@ class GatewayRunner:
             except Exception:
                 pass
 
-    async def _handle_fast_command(self, event: MessageEvent) -> str:
-        """Handle /fast — session-local Codex fast mode."""
-        from hermes_cli.fast_mode import FAST_MODE_USAGE, fast_mode_note, parse_fast_command_arg
+    async def _handle_fast_command_impl(self, event: MessageEvent, *, explicit_temp: bool) -> str:
+        """Handle /fast and /fast-temp gateway commands."""
+        from hermes_cli.fast_mode import (
+            FAST_MODE_USAGE,
+            FAST_TEMP_MODE_USAGE,
+            fast_mode_note,
+            parse_fast_command_arg,
+        )
 
+        usage = FAST_TEMP_MODE_USAGE if explicit_temp else FAST_MODE_USAGE
         action = parse_fast_command_arg(event.get_command_args())
         if action is None:
-            return f"⚡ Usage: `{FAST_MODE_USAGE}`"
+            return f"⚡ Usage: `{usage}`"
 
         session_entry = self.session_store.get_or_create_session(event.source)
         current_enabled = getattr(session_entry, "service_tier_override", None) == "fast"
@@ -4867,7 +4876,17 @@ class GatewayRunner:
         lines = [f"⚡ **Fast mode:** {state}", f"_{fast_mode_note(enabled=enabled)}_"]
         if action != "status":
             lines.append("_(takes effect on next message)_")
+        if explicit_temp:
+            lines.append("_(session only — not saved to config)_")
         return "\n".join(lines)
+
+    async def _handle_fast_command(self, event: MessageEvent) -> str:
+        """Handle /fast — session-local Codex fast mode."""
+        return await self._handle_fast_command_impl(event, explicit_temp=False)
+
+    async def _handle_fast_temp_command(self, event: MessageEvent) -> str:
+        """Handle /fast-temp — session-local Codex fast mode with explicit temp semantics."""
+        return await self._handle_fast_command_impl(event, explicit_temp=True)
 
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
         """Handle /reasoning command — manage reasoning effort and display toggle.

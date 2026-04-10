@@ -85,6 +85,13 @@ class TestMaxTurnsResolution:
         assert isinstance(cli.max_turns, int) and cli.max_turns == 90
 
 
+class TestContextModeDefaults:
+    def test_cli_defaults_to_1m_context_mode(self):
+        cli = _make_cli(config_overrides={"compression": {"threshold": 0.50}})
+        assert cli.context_length_override == 1_000_000
+        assert cli.context_compaction_threshold == 0.75
+
+
 class TestVerboseAndToolProgress:
     def test_default_verbose_is_bool(self):
         cli = _make_cli()
@@ -97,24 +104,25 @@ class TestVerboseAndToolProgress:
 
 
 class TestBusyInputMode:
-    def test_default_busy_input_mode_is_interrupt(self):
+    def test_default_busy_input_mode_is_queue(self):
         cli = _make_cli()
-        assert cli.busy_input_mode == "interrupt"
+        assert cli.busy_input_mode == "queue"
 
     def test_busy_input_mode_queue_is_honored(self):
         cli = _make_cli(config_overrides={"display": {"busy_input_mode": "queue"}})
         assert cli.busy_input_mode == "queue"
 
-    def test_unknown_busy_input_mode_falls_back_to_interrupt(self):
+    def test_unknown_busy_input_mode_falls_back_to_queue(self):
         cli = _make_cli(config_overrides={"display": {"busy_input_mode": "bogus"}})
-        assert cli.busy_input_mode == "interrupt"
+        assert cli.busy_input_mode == "queue"
 
     def test_queue_command_works_while_busy(self):
-        """When agent is running, /queue should still put the prompt in _pending_input."""
+        """When agent is running, /queue should stage the prompt for the next safe boundary."""
         cli = _make_cli()
         cli._agent_running = True
         cli.process_command("/queue follow up")
-        assert cli._pending_input.get_nowait() == "follow up"
+        assert cli._tool_boundary_input_queue.get_nowait() == "follow up"
+        assert cli._pending_input.empty()
 
     def test_queue_command_works_while_idle(self):
         """When agent is idle, /queue should still queue (not reject)."""
@@ -123,28 +131,43 @@ class TestBusyInputMode:
         cli.process_command("/queue follow up")
         assert cli._pending_input.get_nowait() == "follow up"
 
-    def test_queue_mode_routes_busy_enter_to_pending(self):
-        """In queue mode, Enter while busy should go to _pending_input, not _interrupt_queue."""
+    def test_q_alias_works_while_idle(self):
+        cli = _make_cli()
+        cli._agent_running = False
+        cli.process_command("/q follow up")
+        assert cli._pending_input.get_nowait() == "follow up"
+
+    def test_bare_q_shows_queue_usage_and_exit_guidance(self):
+        cli = _make_cli()
+
+        with patch("cli._cprint") as mock_cprint:
+            result = cli.process_command("/q")
+
+        assert result is True
+        printed = "\n".join(str(call.args[0]) for call in mock_cprint.call_args_list)
+        assert "Usage: /queue <prompt>" in printed
+        assert "/quit or /exit" in printed
+
+    def test_queue_mode_routes_busy_enter_to_tool_boundary_queue(self):
+        """In queue mode, Enter while busy should stage the message for the next tool boundary."""
         cli = _make_cli(config_overrides={"display": {"busy_input_mode": "queue"}})
         cli._agent_running = True
-        # Simulate what handle_enter does for non-command input while busy
-        text = "follow up"
-        if cli.busy_input_mode == "queue":
-            cli._pending_input.put(text)
-        else:
-            cli._interrupt_queue.put(text)
-        assert cli._pending_input.get_nowait() == "follow up"
+
+        result = cli._submit_busy_input("follow up")
+
+        assert result == "queue"
+        assert cli._tool_boundary_input_queue.get_nowait() == "follow up"
+        assert cli._pending_input.empty()
         assert cli._interrupt_queue.empty()
 
     def test_interrupt_mode_routes_busy_enter_to_interrupt(self):
-        """In interrupt mode (default), Enter while busy goes to _interrupt_queue."""
-        cli = _make_cli()
+        """In interrupt mode, Enter while busy goes to _interrupt_queue."""
+        cli = _make_cli(config_overrides={"display": {"busy_input_mode": "interrupt"}})
         cli._agent_running = True
-        text = "redirect"
-        if cli.busy_input_mode == "queue":
-            cli._pending_input.put(text)
-        else:
-            cli._interrupt_queue.put(text)
+
+        result = cli._submit_busy_input("redirect")
+
+        assert result == "interrupt"
         assert cli._interrupt_queue.get_nowait() == "redirect"
         assert cli._pending_input.empty()
 

@@ -6,6 +6,7 @@ from typing import Optional
 
 
 FAST_MODE_USAGE = "/fast [on|off|status]"
+FAST_TEMP_MODE_USAGE = "/fast-temp [on|off|status]"
 FAST_MODE_SUBCOMMANDS = ("on", "off", "status")
 
 

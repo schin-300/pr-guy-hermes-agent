@@ -21,6 +21,9 @@ class _FakeCompressor:
         self.last_total_tokens = 700
         self.compression_count = 3
         self._context_probed = True
+        self.context_length = 1_000_000
+        self.threshold_percent = 0.75
+        self.threshold_tokens = 750_000
 
 
 class _FakeAgent:
@@ -72,6 +75,16 @@ class _FakeAgent:
             self.context_compressor.last_total_tokens = 0
             self.context_compressor.compression_count = 0
             self.context_compressor._context_probed = False
+
+    def set_context_profile(self, *, context_length=None, compression_threshold=None):
+        if context_length is not None:
+            self.context_compressor.context_length = context_length
+        if compression_threshold is not None:
+            self.context_compressor.threshold_percent = compression_threshold
+        self.context_compressor.threshold_tokens = int(
+            self.context_compressor.context_length * self.context_compressor.threshold_percent
+        )
+        return self.context_compressor.context_length
 
 
 def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
@@ -139,6 +152,7 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     old_session_id = cli.session_id
     old_session_start = cli.session_start
     cli.codex_service_tier = "fast"
+    cli.fast_mode_enabled = True
     cli.agent.service_tier = "fast"
 
     cli.process_command("/new")
@@ -157,26 +171,39 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     assert cli.agent.session_id == cli.session_id
     assert cli.agent._last_flushed_db_idx == 0
     assert cli.agent._todo_store.read() == []
-    assert cli.codex_service_tier is None
-    assert cli.agent.service_tier is None
+    assert cli.codex_service_tier == "fast"
+    assert cli.agent.service_tier == "fast"
+    assert cli.context_length_override == 1_000_000
+    assert cli.context_compaction_threshold == 0.75
+    assert cli.agent.context_compressor.context_length == 1_000_000
+    assert cli.agent.context_compressor.threshold_tokens == 750_000
     assert cli.session_start > old_session_start
     assert cli.agent.session_start == cli.session_start
     cli.agent.flush_memories.assert_called_once_with([{"role": "user", "content": "hello"}])
     cli.agent._invalidate_system_prompt.assert_called_once()
 
 
-def test_resume_command_clears_fast_mode(tmp_path):
+def test_resume_command_preserves_persistent_fast_mode_and_restores_default_context_mode(tmp_path):
     cli = _prepare_cli_with_active_session(tmp_path)
     resumed_session_id = "previous_session_123"
     cli._session_db.create_session(session_id=resumed_session_id, source="cli", model=cli.model)
     cli.codex_service_tier = "fast"
+    cli.fast_mode_enabled = True
     cli.agent.service_tier = "fast"
+    cli.context_length_override = 272_000
+    cli.context_compaction_threshold = 0.95
+    cli.agent.context_compressor.context_length = 272_000
+    cli.agent.context_compressor.threshold_tokens = 258_400
 
     cli._handle_resume_command(f"/resume {resumed_session_id}")
 
     assert cli.session_id == resumed_session_id
-    assert cli.codex_service_tier is None
-    assert cli.agent.service_tier is None
+    assert cli.codex_service_tier == "fast"
+    assert cli.agent.service_tier == "fast"
+    assert cli.context_length_override == 1_000_000
+    assert cli.context_compaction_threshold == 0.75
+    assert cli.agent.context_compressor.context_length == 1_000_000
+    assert cli.agent.context_compressor.threshold_tokens == 750_000
 
 
 def test_reset_command_is_alias_for_new_session(tmp_path):
@@ -188,6 +215,17 @@ def test_reset_command_is_alias_for_new_session(tmp_path):
     assert cli.session_id != old_session_id
     assert cli._session_db.get_session(old_session_id)["end_reason"] == "new_session"
     assert cli._session_db.get_session(cli.session_id) is not None
+
+
+def test_cli_init_enables_fast_mode_from_config():
+    cli = _make_cli(
+        config_overrides={
+            "display": {"compact": False, "tool_progress": "all", "fast_mode": True}
+        }
+    )
+
+    assert cli.fast_mode_enabled is True
+    assert cli.codex_service_tier == "fast"
 
 
 def test_clear_command_starts_new_session_before_redrawing(tmp_path):

@@ -86,7 +86,7 @@ class TestResolveCommand:
     def test_alias_resolves_to_canonical(self):
         assert resolve_command("bg").name == "background"
         assert resolve_command("reset").name == "new"
-        assert resolve_command("q").name == "quit"
+        assert resolve_command("q").name == "queue"
         assert resolve_command("exit").name == "quit"
         assert resolve_command("gateway").name == "platforms"
         assert resolve_command("set-home").name == "sethome"
@@ -99,6 +99,10 @@ class TestResolveCommand:
     def test_unknown_returns_none(self):
         assert resolve_command("nonexistent") is None
         assert resolve_command("") is None
+
+    def test_removed_context_limit_commands_do_not_resolve(self):
+        assert resolve_command("context-limit") is None
+        assert resolve_command("context-limit-temp") is None
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +127,9 @@ class TestDerivedDicts:
         assert "/bg" in COMMANDS
         assert "/reset" in COMMANDS
         assert "/q" in COMMANDS
+        assert "alias for /queue" in COMMANDS["/q"]
         assert "/exit" in COMMANDS
+        assert "alias for /quit" in COMMANDS["/exit"]
         assert "/reload_mcp" in COMMANDS
         assert "/gateway" in COMMANDS
 

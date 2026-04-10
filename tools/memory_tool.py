@@ -81,6 +81,28 @@ _INVISIBLE_CHARS = {
     '\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
 }
 
+_COMPACTION_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "into", "about", "your",
+    "user", "users", "agent", "hermes", "memory", "profile", "notes", "entry",
+    "entries", "them", "they", "their", "there", "what", "when", "where", "which",
+    "while", "have", "has", "had", "would", "could", "should", "keep", "uses",
+    "old", "note", "notes",
+    "using", "used", "just", "more", "most", "very", "still", "will", "before",
+    "after", "then", "than", "onto", "over", "under", "same", "only", "also",
+    "like", "want", "wants", "need", "needs", "being", "been", "because",
+    "avoid", "prefer", "always", "never", "dont", "don't", "doesnt", "doesn't",
+}
+
+_COMPACTION_STRONG_SIGNALS = (
+    "prefer", "avoid", "don't", "do not", "never", "always", "ask", "must",
+    "keep", "use", "first", "approval", "clarify",
+)
+
+_COMPACTION_MEDIUM_SIGNALS = (
+    "workflow", "terminal", "gui", "repo", "docs", "testing", "review",
+    "profile", "memory", "honcho", "branch", "worktree", "ssh", "tmux",
+)
+
 
 def _scan_memory_content(content: str) -> Optional[str]:
     """Scan memory content for injection/exfil patterns. Returns error string if blocked."""
@@ -95,6 +117,150 @@ def _scan_memory_content(content: str) -> Optional[str]:
             return f"Blocked: content matches threat pattern '{pid}'. Memory entries are injected into the system prompt and must not contain injection or exfiltration payloads."
 
     return None
+
+
+def _normalize_entry_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+
+def _tokenize_topic_words(text: str) -> List[str]:
+    words = re.findall(r"[a-z0-9][a-z0-9_\-/]*", (text or "").lower())
+    tokens = []
+    for word in words:
+        if len(word) < 3:
+            continue
+        if word in _COMPACTION_STOPWORDS:
+            continue
+        tokens.append(word)
+    return tokens
+
+
+
+def _rank_topic_tokens(text: str, max_words: Optional[int] = None) -> List[str]:
+    counts: Dict[str, int] = {}
+    ordered_tokens: List[str] = []
+    for token in _tokenize_topic_words(text):
+        if token not in counts:
+            counts[token] = 0
+            ordered_tokens.append(token)
+        counts[token] += 1
+
+    ranked = sorted(ordered_tokens, key=lambda token: (-counts[token], ordered_tokens.index(token), token))
+    if max_words is None:
+        return ranked
+    return ranked[:max_words]
+
+
+
+def _topic_label(text: str, max_words: int = 3) -> str:
+    chosen = _rank_topic_tokens(text, max_words=max_words)
+    if not chosen:
+        fallback = _normalize_entry_text(text)
+        return fallback[:48] + ("..." if len(fallback) > 48 else "")
+    return ", ".join(chosen)
+
+
+
+def _topic_overlap_score(left_tokens: set[str], right_tokens: set[str]) -> float:
+    if not left_tokens or not right_tokens:
+        return 0.0
+    overlap = left_tokens & right_tokens
+    if not overlap:
+        return 0.0
+    union = left_tokens | right_tokens
+    jaccard = len(overlap) / max(1, len(union))
+    bonus = 0.15 if len(overlap) >= 2 else 0.0
+    return jaccard + bonus
+
+
+
+def _truncate_words(text: str, limit: int) -> str:
+    text = _normalize_entry_text(text)
+    if len(text) <= limit:
+        return text
+    if limit <= 0:
+        return ""
+    if " " not in text:
+        return text[:limit].rstrip(" ,;.")
+    clipped = text[: limit + 1]
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0]
+    return clipped.rstrip(" ,;.")
+
+
+
+def _split_clauses(text: str) -> List[str]:
+    normalized = _normalize_entry_text(text)
+    if not normalized:
+        return []
+    parts = re.split(r";|\.(?=\s+[A-Z`/])", normalized)
+    clauses = []
+    for part in parts:
+        clause = part.strip(" .;")
+        if clause:
+            clauses.append(clause)
+    return clauses or [normalized]
+
+
+
+def _clause_score(clause: str) -> float:
+    lower = clause.lower()
+    score = 0.0
+    if any(signal in lower for signal in _COMPACTION_STRONG_SIGNALS):
+        score += 4.0
+    if any(signal in lower for signal in _COMPACTION_MEDIUM_SIGNALS):
+        score += 2.0
+    if any(ch in clause for ch in ("`", "/")):
+        score += 1.0
+    score -= len(clause) / 180.0
+    return score
+
+
+
+def _compact_entry_text(target: str, text: str) -> str:
+    normalized = _normalize_entry_text(text)
+    if not normalized:
+        return normalized
+
+    target_len = int(len(normalized) * (0.68 if target == "user" else 0.72))
+    minimum_len = 58 if target == "user" else 80
+    target_len = max(minimum_len, min(len(normalized) - 16, target_len))
+    if target_len >= len(normalized):
+        return normalized
+
+    clauses = _split_clauses(normalized)
+    if len(clauses) == 1:
+        return _truncate_words(normalized, target_len)
+
+    chosen: List[tuple[int, str]] = [(0, clauses[0])]
+    remaining = list(enumerate(clauses[1:], start=1))
+    remaining.sort(key=lambda item: (-_clause_score(item[1]), len(item[1]), item[0]))
+
+    for idx, clause in remaining:
+        candidate = "; ".join(part for _, part in sorted(chosen + [(idx, clause)]))
+        if len(candidate) <= target_len:
+            chosen.append((idx, clause))
+
+    compacted = "; ".join(part for _, part in sorted(chosen))
+    compacted = _truncate_words(compacted, target_len)
+    return compacted if len(compacted) < len(normalized) else normalized
+
+
+
+def _entry_value_score(target: str, entry: str) -> float:
+    lower = entry.lower()
+    score = 0.0
+    if any(signal in lower for signal in _COMPACTION_STRONG_SIGNALS):
+        score += 4.0
+    if any(signal in lower for signal in _COMPACTION_MEDIUM_SIGNALS):
+        score += 2.0
+    if any(ch in entry for ch in ("`", "/")):
+        score += 1.2
+    if target == "memory" and re.search(r"/|\.json|\.yaml|\.yml|\.md|localhost|127\.0\.0\.1", lower):
+        score -= 1.0
+    score -= len(entry) / (170.0 if target == "user" else 220.0)
+    return score
 
 
 class MemoryStore:
@@ -194,6 +360,333 @@ class MemoryStore:
         if target == "user":
             return self.user_char_limit
         return self.memory_char_limit
+
+    def _projected_total_after_write(
+        self,
+        target: str,
+        incoming_content: str,
+        action: str = "add",
+        old_text: Optional[str] = None,
+        entries: Optional[List[str]] = None,
+    ) -> int:
+        entries = list(entries if entries is not None else self._entries_for(target))
+        incoming = _normalize_entry_text(incoming_content)
+        if action == "replace" and old_text:
+            matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
+            if len(matches) == 1:
+                updated = entries.copy()
+                updated[matches[0][0]] = incoming
+                return len(ENTRY_DELIMITER.join(updated)) if updated else 0
+        updated = entries + ([incoming] if incoming else [])
+        return len(ENTRY_DELIMITER.join(updated)) if updated else 0
+
+    @staticmethod
+    def _entries_char_count(entries: List[str]) -> int:
+        return len(ENTRY_DELIMITER.join(entries)) if entries else 0
+
+    def _chars_saved_by_removing_entries(self, target: str, entries_to_remove: List[str]) -> int:
+        current_entries = list(self._entries_for(target))
+        current_total = self._entries_char_count(current_entries)
+        remaining = list(current_entries)
+        for old_entry in entries_to_remove:
+            normalized = _normalize_entry_text(old_entry)
+            idx = next((i for i, entry in enumerate(remaining) if _normalize_entry_text(entry) == normalized), None)
+            if idx is None:
+                idx = next((i for i, entry in enumerate(remaining) if normalized and normalized in _normalize_entry_text(entry)), None)
+            if idx is not None:
+                remaining.pop(idx)
+        return max(0, current_total - self._entries_char_count(remaining))
+
+    def _build_topic_groups(self, target: str, incoming_content: str, target_chars_to_free: int) -> List[Dict[str, Any]]:
+        entries = list(self._entries_for(target))
+        incoming_tokens = set(_rank_topic_tokens(incoming_content, max_words=8))
+        groups: List[Dict[str, Any]] = []
+
+        for entry in entries:
+            tokens = set(_rank_topic_tokens(entry, max_words=8))
+            best_idx = None
+            best_score = 0.0
+            for idx, group in enumerate(groups):
+                score = _topic_overlap_score(tokens, group["tokens"])
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+            if best_idx is not None and best_score >= 0.25:
+                group = groups[best_idx]
+                group["entries"].append(entry)
+                group["tokens"].update(tokens)
+            else:
+                groups.append({
+                    "entries": [entry],
+                    "tokens": set(tokens),
+                })
+
+        ranked_groups: List[Dict[str, Any]] = []
+        for group in groups:
+            group_entries = group["entries"]
+            combined_text = " ".join(group_entries)
+            ranked_tokens = _rank_topic_tokens(combined_text, max_words=3)
+            topic = ", ".join(ranked_tokens) if ranked_tokens else _topic_label(combined_text)
+            chars_freed = self._chars_saved_by_removing_entries(target, group_entries)
+            if chars_freed <= 0:
+                continue
+            avg_value = sum(_entry_value_score(target, entry) for entry in group_entries) / max(1, len(group_entries))
+            overlap_tokens = [token for token in ranked_tokens if token in incoming_tokens]
+            if overlap_tokens:
+                reason = f"Topic overlaps with the incoming memory on {', '.join(overlap_tokens[:2])}; delete only if this whole topic is stale."
+            else:
+                reason = "Potentially stale topic cluster with no strong overlap to the new memory."
+            ranked_groups.append({
+                "topic": topic,
+                "entry_count": len(group_entries),
+                "chars_freed_if_removed": chars_freed,
+                "entries": list(group_entries),
+                "reason": reason,
+                "overlap_tokens": overlap_tokens,
+                "_sort": (1 if overlap_tokens else 0, avg_value, -chars_freed),
+            })
+
+        ranked_groups.sort(key=lambda group: group.get("_sort", (99, 99, 99)))
+
+        selected_groups: List[Dict[str, Any]] = []
+        cumulative_freed = 0
+        for idx, group in enumerate(ranked_groups, start=1):
+            selected_groups.append({
+                "id": idx,
+                "topic": group["topic"],
+                "entry_count": group["entry_count"],
+                "chars_freed_if_removed": group["chars_freed_if_removed"],
+                "entries": group["entries"],
+                "reason": group["reason"],
+                "overlap_tokens": group["overlap_tokens"],
+            })
+            cumulative_freed += int(group["chars_freed_if_removed"])
+            if len(selected_groups) >= 6:
+                break
+            if cumulative_freed >= max(target_chars_to_free, 1) and len(selected_groups) >= 2:
+                break
+
+        return selected_groups
+
+    def build_topic_group_selection_proposal(
+        self,
+        target: str,
+        proposal: Dict[str, Any],
+        selected_group_ids: List[int],
+    ) -> Dict[str, Any]:
+        topic_groups = proposal.get("topic_groups", []) if isinstance(proposal, dict) else []
+        group_map = {
+            int(group.get("id")): group
+            for group in topic_groups
+            if str(group.get("id", "")).isdigit()
+        }
+        matched_groups: List[Dict[str, Any]] = []
+        for group_id in selected_group_ids:
+            group = group_map.get(int(group_id))
+            if group and group not in matched_groups:
+                matched_groups.append(group)
+
+        if not matched_groups:
+            return {"success": False, "error": "No valid topic groups were selected."}
+
+        selected_entries: List[str] = []
+        seen_entries = set()
+        candidates: List[Dict[str, Any]] = []
+        for group in matched_groups:
+            topic = str(group.get("topic", "memory") or "memory")
+            group_id = int(group.get("id"))
+            for entry in group.get("entries", []) or []:
+                normalized = _normalize_entry_text(entry)
+                if not normalized or normalized in seen_entries:
+                    continue
+                seen_entries.add(normalized)
+                selected_entries.append(entry)
+                candidates.append({
+                    "kind": "remove",
+                    "topic": topic,
+                    "group_id": group_id,
+                    "old_entry": entry,
+                    "new_entry": None,
+                    "chars_saved": len(entry) + len(ENTRY_DELIMITER),
+                    "reason": f"Removed by user-selected topic group #{group_id}.",
+                })
+
+        freed_chars = self._chars_saved_by_removing_entries(target, selected_entries)
+        current_usage = int(proposal.get("current_usage", self._char_count(target)) or self._char_count(target))
+        projected_after_write = int(proposal.get("projected_after_write", current_usage) or current_usage)
+        limit = int(proposal.get("limit", self._char_limit(target)) or self._char_limit(target))
+        estimated_usage_after_compaction = max(current_usage - freed_chars, 0)
+        estimated_usage_after_retry = max(projected_after_write - freed_chars, 0)
+
+        return {
+            "success": True,
+            "target": target,
+            "limit": limit,
+            "current_usage": current_usage,
+            "projected_after_write": projected_after_write,
+            "required_chars": max(0, projected_after_write - limit),
+            "target_chars_to_free": int(proposal.get("target_chars_to_free", 0) or 0),
+            "freed_chars": freed_chars,
+            "estimated_usage_after_compaction": estimated_usage_after_compaction,
+            "estimated_usage_after_retry": estimated_usage_after_retry,
+            "can_make_room": estimated_usage_after_retry <= limit,
+            "candidates": candidates,
+            "topic_groups": topic_groups,
+            "selected_group_ids": [int(group.get("id")) for group in matched_groups],
+            "incoming_content": proposal.get("incoming_content", ""),
+            "action": proposal.get("action", "add"),
+            "old_text": proposal.get("old_text"),
+        }
+
+    def build_compaction_proposal(
+        self,
+        target: str,
+        incoming_content: str,
+        action: str = "add",
+        old_text: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        entries = list(self._entries_for(target))
+        limit = self._char_limit(target)
+        current = self._char_count(target)
+        projected_after_write = self._projected_total_after_write(
+            target,
+            incoming_content,
+            action=action,
+            old_text=old_text,
+            entries=entries,
+        )
+        required_chars = max(0, projected_after_write - limit)
+        desired_headroom = max(24, min(120, int(limit * 0.08)))
+        target_chars_to_free = required_chars + desired_headroom if required_chars > 0 else desired_headroom
+
+        candidate_pool: List[Dict[str, Any]] = []
+        seen_normalized: Dict[str, str] = {}
+        touched_entries = set()
+
+        for entry in entries:
+            normalized = _normalize_entry_text(entry).lower()
+            if normalized in seen_normalized:
+                candidate_pool.append({
+                    "kind": "remove",
+                    "topic": _topic_label(entry),
+                    "old_entry": entry,
+                    "new_entry": None,
+                    "chars_saved": len(entry) + len(ENTRY_DELIMITER),
+                    "reason": "Exact duplicate entry.",
+                    "_sort": (0, _entry_value_score(target, entry), -(len(entry) + len(ENTRY_DELIMITER))),
+                })
+            else:
+                seen_normalized[normalized] = entry
+
+        for entry in entries:
+            compacted = _compact_entry_text(target, entry)
+            if not compacted or compacted == entry:
+                continue
+            saved = len(entry) - len(compacted)
+            if saved < 16:
+                continue
+            candidate_pool.append({
+                "kind": "shorten",
+                "topic": _topic_label(entry),
+                "old_entry": entry,
+                "new_entry": compacted,
+                "chars_saved": saved,
+                "reason": "Verbose entry can be shortened while keeping the core instruction.",
+                "_sort": (1, _entry_value_score(target, entry), -saved),
+            })
+
+        allow_user_removals = target != "user"
+        shorten_capacity = sum(c["chars_saved"] for c in candidate_pool if c["kind"] == "shorten")
+        if required_chars > max(0, shorten_capacity):
+            allow_user_removals = True
+
+        if allow_user_removals:
+            for entry in entries:
+                candidate_pool.append({
+                    "kind": "remove",
+                    "topic": _topic_label(entry),
+                    "old_entry": entry,
+                    "new_entry": None,
+                    "chars_saved": len(entry) + len(ENTRY_DELIMITER),
+                    "reason": "Lowest-priority entry if more room is needed.",
+                    "_sort": (2, _entry_value_score(target, entry), -(len(entry) + len(ENTRY_DELIMITER))),
+                })
+
+        candidate_pool.sort(key=lambda candidate: candidate.get("_sort", (99, 99, 99)))
+
+        selected: List[Dict[str, Any]] = []
+        freed_chars = 0
+        for candidate in candidate_pool:
+            old_entry = candidate.get("old_entry", "")
+            if old_entry in touched_entries:
+                continue
+            selected.append({k: v for k, v in candidate.items() if not k.startswith("_")})
+            touched_entries.add(old_entry)
+            freed_chars += int(candidate.get("chars_saved", 0))
+            if freed_chars >= target_chars_to_free:
+                break
+
+        estimated_usage_after_compaction = max(current - freed_chars, 0)
+        estimated_usage_after_retry = max(projected_after_write - freed_chars, 0)
+        topic_groups = self._build_topic_groups(target, incoming_content, target_chars_to_free)
+        return {
+            "success": True,
+            "target": target,
+            "limit": limit,
+            "current_usage": current,
+            "projected_after_write": projected_after_write,
+            "required_chars": required_chars,
+            "target_chars_to_free": target_chars_to_free,
+            "freed_chars": freed_chars,
+            "estimated_usage_after_compaction": estimated_usage_after_compaction,
+            "estimated_usage_after_retry": estimated_usage_after_retry,
+            "can_make_room": estimated_usage_after_retry <= limit,
+            "candidates": selected,
+            "topic_groups": topic_groups,
+            "incoming_content": _normalize_entry_text(incoming_content),
+            "action": action,
+            "old_text": old_text,
+        }
+
+    def apply_compaction_proposal(self, target: str, proposal: Dict[str, Any]) -> Dict[str, Any]:
+        candidates = proposal.get("candidates") if isinstance(proposal, dict) else None
+        if not candidates:
+            return {"success": False, "error": "Compaction proposal is empty."}
+
+        applied = []
+        with self._file_lock(self._path_for(target)):
+            self._reload_target(target)
+            entries = list(self._entries_for(target))
+
+            for candidate in candidates:
+                old_entry = _normalize_entry_text(candidate.get("old_entry", ""))
+                if not old_entry:
+                    continue
+                idx = next((i for i, entry in enumerate(entries) if _normalize_entry_text(entry) == old_entry), None)
+                if idx is None:
+                    idx = next((i for i, entry in enumerate(entries) if old_entry in entry), None)
+                if idx is None:
+                    continue
+
+                kind = candidate.get("kind")
+                if kind == "shorten":
+                    new_entry = _normalize_entry_text(candidate.get("new_entry", ""))
+                    if not new_entry:
+                        continue
+                    entries[idx] = new_entry
+                    applied.append({"kind": kind, "topic": candidate.get("topic", ""), "old_entry": old_entry, "new_entry": new_entry})
+                elif kind == "remove":
+                    entries.pop(idx)
+                    applied.append({"kind": kind, "topic": candidate.get("topic", ""), "old_entry": old_entry})
+
+            entries = [_normalize_entry_text(entry) for entry in entries if _normalize_entry_text(entry)]
+            entries = list(dict.fromkeys(entries))
+            self._set_entries(target, entries)
+            self.save_to_disk(target)
+
+        resp = self._success_response(target, "Compaction applied.")
+        resp["compaction_applied"] = applied
+        return resp
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""

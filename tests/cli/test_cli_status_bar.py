@@ -41,6 +41,7 @@ def _attach_agent(
         session_completion_tokens=completion_tokens,
         session_total_tokens=total_tokens,
         session_api_calls=api_calls,
+        get_rate_limit_state=lambda: SimpleNamespace(has_data=False),
         context_compressor=SimpleNamespace(
             last_prompt_tokens=context_tokens,
             context_length=context_length,
@@ -78,6 +79,37 @@ class TestCLIStatusBar:
         assert "6%" in text
         assert "$0.06" not in text  # cost hidden by default
         assert "15m" in text
+
+    def test_build_status_bar_text_includes_fast_indicator_when_enabled(self):
+        cli_obj = _attach_agent(
+            _make_cli(model="gpt-5.4"),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=12_450,
+            context_length=200_000,
+        )
+        cli_obj.codex_service_tier = "fast"
+
+        text = cli_obj._build_status_bar_text(width=120)
+
+        assert "⚡ fast" in text
+
+    def test_build_status_bar_text_omits_fast_indicator_when_disabled(self):
+        cli_obj = _attach_agent(
+            _make_cli(model="gpt-5.4"),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=12_450,
+            context_length=200_000,
+        )
+
+        text = cli_obj._build_status_bar_text(width=120)
+
+        assert "⚡ fast" not in text
 
     def test_input_height_counts_wide_characters_using_cell_width(self):
         cli_obj = _make_cli()
@@ -306,6 +338,21 @@ class TestStatusBarWidthSource:
                 f"At width={width}, fragment total {display_width} cells overflows "
                 f"({total_text!r})"
             )
+
+    def test_fragments_include_fast_indicator_when_enabled(self):
+        from unittest.mock import MagicMock, patch
+
+        cli_obj = self._make_wide_cli()
+        cli_obj.codex_service_tier = "fast"
+
+        mock_app = MagicMock()
+        mock_app.output.get_size.return_value = MagicMock(columns=120)
+
+        with patch("prompt_toolkit.application.get_app", return_value=mock_app):
+            frags = cli_obj._get_status_bar_fragments()
+
+        assert any(style == "class:status-bar-fast-key" for style, _ in frags)
+        assert "⚡ fast" in "".join(text for _, text in frags)
 
     def test_fragments_use_pt_width_over_shutil(self):
         """When prompt_toolkit reports a width, shutil.get_terminal_size must not be used."""

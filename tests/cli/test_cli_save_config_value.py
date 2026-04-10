@@ -78,3 +78,18 @@ class TestSaveConfigValueAtomic:
 
         assert result is False
         assert config_env.read_text() == original_content
+
+    def test_creates_user_config_when_missing(self, tmp_path, monkeypatch):
+        """First write should target ~/.hermes/config.yaml, not repo cli-config.yaml."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setattr("cli._hermes_home", hermes_home)
+        mock_atomic = MagicMock()
+        monkeypatch.setattr("utils.atomic_yaml_write", mock_atomic)
+
+        from cli import save_config_value
+        save_config_value("display.fast_mode", True)
+
+        written_path, written_data = mock_atomic.call_args[0]
+        assert Path(written_path) == hermes_home / "config.yaml"
+        assert written_data["display"]["fast_mode"] is True

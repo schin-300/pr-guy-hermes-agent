@@ -9,6 +9,10 @@ def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
     cli_obj = HermesCLI.__new__(HermesCLI)
     cli_obj.model = model
     cli_obj.agent = None
+    cli_obj._clarify_state = None
+    cli_obj._approval_state = None
+    cli_obj._sudo_state = None
+    cli_obj._secret_state = None
     cli_obj._todo_plan_signature = ""
     cli_obj._todo_plan_updated_at = 0.0
     cli_obj._todo_plan_refresh_timer = None
@@ -36,6 +40,13 @@ def _attach_todos(cli_obj, items):
     return cli_obj
 
 
+def _task_items(count: int):
+    return [
+        {"id": f"step-{idx}", "content": f"Step {idx}", "status": "pending", "kind": "task"}
+        for idx in range(count)
+    ]
+
+
 class TestCLITodoPlanWidget:
     def test_build_todo_plan_lines_returns_empty_without_todos(self):
         cli_obj = _make_cli()
@@ -43,85 +54,66 @@ class TestCLITodoPlanWidget:
         assert cli_obj._build_todo_plan_lines(width=100) == []
         assert cli_obj._get_todo_plan_height() == 0
 
-    def test_build_todo_plan_lines_show_block_kinds(self):
-        cli_obj = _attach_todos(
-            _make_cli(),
-            [
-                {"id": "ship", "content": "Ship popup", "status": "in_progress", "kind": "task"},
-                {
-                    "id": "review",
-                    "content": "Review popup against expected behavior",
-                    "status": "pending",
-                    "kind": "review_loop",
-                    "success_criteria": "Popup edits persist and the plan board blocks completion until review passes.",
-                },
-            ],
-        )
+    def test_inline_plan_widget_hidden_while_clarify_prompt_active(self):
+        cli_obj = _attach_todos(_make_cli(), _task_items(3))
+        cli_obj._clarify_state = {"question": "Need your input"}
+
+        assert cli_obj._should_show_inline_plan_widget() is False
+
+    def test_inline_plan_widget_hidden_while_approval_prompt_active(self):
+        cli_obj = _attach_todos(_make_cli(), _task_items(3))
+        cli_obj._approval_state = {"command": "rm -rf /tmp/demo"}
+
+        assert cli_obj._should_show_inline_plan_widget() is False
+
+    def test_inline_plan_widget_visible_when_no_modal_prompt_is_active(self):
+        cli_obj = _attach_todos(_make_cli(), _task_items(3))
+
+        assert cli_obj._should_show_inline_plan_widget() is True
+
+    def test_build_todo_plan_lines_show_plain_tasks_and_more_rows(self):
+        cli_obj = _attach_todos(_make_cli(), _task_items(20))
         cli_obj._mark_todo_plan_updated(cli_obj._get_todo_items())
 
-        lines = cli_obj._build_todo_plan_lines(width=100)
+        lines = cli_obj._build_todo_plan_lines(width=120)
         texts = [text for _style, text in lines]
 
         assert texts[0] == "• Updated Plan"
-        assert any("[task] Ship popup" in text for text in texts)
-        assert any("[review-loop] Review popup against expected behavior" in text for text in texts)
+        assert any("Starting with: Step 0" in text for text in texts)
+        assert any("☐ Step 0" in text for text in texts)
+        assert any("☐ Step 4" in text for text in texts)
+        assert any("… +2 more lines" in text for text in texts)
 
-    def test_build_plan_popup_lines_show_selected_review_loop_details(self):
-        cli_obj = _attach_todos(
-            _make_cli(),
-            [
-                {"id": "ship", "content": "Ship popup", "status": "completed", "kind": "task"},
-                {
-                    "id": "review",
-                    "content": "Review popup against expected behavior",
-                    "status": "pending",
-                    "kind": "review_loop",
-                    "success_criteria": "Popup edits persist and the plan board blocks completion until review passes.",
-                    "reviewer_profile": "gpt-5.4 reviewer",
-                },
-            ],
-        )
-        cli_obj._plan_popup_state = {"selected": 1, "mode": "browse"}
+    def test_build_plan_popup_lines_show_plain_tasks_and_more_rows(self):
+        cli_obj = _attach_todos(_make_cli(), _task_items(20))
+        cli_obj._plan_popup_state = {"selected": 10, "mode": "browse"}
 
-        lines = cli_obj._build_plan_popup_lines(width=100)
+        lines = cli_obj._build_plan_popup_lines(width=120)
         texts = [text for _style, text in lines]
 
-        assert texts[0].startswith("↑/↓ select")
-        assert any("❯ ☐ [review-loop] Review popup against expected behavior" in text for text in texts)
-        assert any("Expected: Popup edits persist" in text for text in texts)
-        assert any("Reviewer: gpt-5.4 reviewer" in text for text in texts)
+        assert texts[0].startswith("↑/↓ select · a add task")
+        assert any("esc close" in text for text in texts)
+        assert any("❯ ☐ Step 10" in text for text in texts)
+        assert any("☐ Step 7" in text for text in texts)
+        assert not any("[review-loop]" in text.lower() for text in texts)
 
-    def test_plan_popup_commit_entry_adds_task_and_snapshot_message(self):
-        cli_obj = _attach_todos(_make_cli(), [])
+    def test_plan_popup_commit_entry_adds_plain_task_and_persists_snapshot(self):
+        cli_obj = _attach_todos(
+            _make_cli(),
+            [{"id": "inspect", "content": "Inspect code paths", "status": "pending", "kind": "task"}],
+        )
         cli_obj._plan_popup_state = {"selected": 0, "mode": "add_task"}
 
-        committed = cli_obj._plan_popup_commit_entry("Containerize the project workspace")
+        committed = cli_obj._plan_popup_commit_entry("Follow up on the remaining edge cases")
 
         assert committed is True
         items = cli_obj._get_todo_items()
-        assert len(items) == 1
-        assert items[0]["kind"] == "task"
-        assert items[0]["content"] == "Containerize the project workspace"
+        assert items[-1]["content"] == "Follow up on the remaining edge cases"
+        assert items[-1]["kind"] == "task"
+        assert "parent_id" not in items[-1]
         assert cli_obj.conversation_history[-1]["role"] == "user"
         assert cli_obj.conversation_history[-1]["content"].startswith(TODO_SNAPSHOT_MARKER)
         assert cli_obj._plan_popup_state["mode"] == "browse"
-
-    def test_plan_popup_commit_entry_adds_review_loop_defaults(self):
-        cli_obj = _attach_todos(_make_cli(), [])
-        cli_obj._plan_popup_state = {"selected": 0, "mode": "add_review"}
-
-        committed = cli_obj._plan_popup_commit_entry(
-            "Review containerized result | Tests pass in the container and expected files exist | Compare requested result to delivered work"
-        )
-
-        assert committed is True
-        items = cli_obj._get_todo_items()
-        assert len(items) == 1
-        item = items[0]
-        assert item["kind"] == "review_loop"
-        assert item["success_criteria"] == "Tests pass in the container and expected files exist"
-        assert item["reviewer_profile"] == "gpt-5.4 reviewer"
-        assert item["reviewer_prompt"] == "Compare requested result to delivered work"
 
     def test_plan_popup_set_selected_status_keeps_single_in_progress(self):
         cli_obj = _attach_todos(
@@ -160,26 +152,6 @@ class TestCLITodoPlanWidget:
         assert cli_obj._todo_plan_updated_at > 0
         assert cli_obj.conversation_history[-1]["content"].startswith(TODO_SNAPSHOT_MARKER)
         cli_obj._invalidate.assert_called_once()
-
-    def test_build_todo_plan_lines_stay_compact_in_narrow_terminals(self):
-        cli_obj = _attach_todos(
-            _make_cli(),
-            [
-                {
-                    "id": f"step-{idx}",
-                    "content": "Implement a compact plan widget that never floods the terminal with wrapped rows",
-                    "status": "in_progress" if idx == 0 else "pending",
-                    "kind": "task",
-                }
-                for idx in range(6)
-            ],
-        )
-
-        for width in (42, 20, 12):
-            lines = cli_obj._build_todo_plan_lines(width=width)
-            assert lines
-            assert len(lines) <= 8
-            assert all(HermesCLI._status_bar_display_width(text) <= width for _style, text in lines)
 
     def test_dedupe_todo_snapshot_messages_keeps_latest_only(self):
         cli_obj = _make_cli()

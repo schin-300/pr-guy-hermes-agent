@@ -47,7 +47,29 @@ def test_set_context_length_override_updates_live_compressor_and_runtime():
     assert agent.context_compressor.threshold_tokens == int(
         1_000_000 * agent.context_compressor.threshold_percent
     )
+    assert agent.context_compressor.tail_token_budget == int(
+        agent.context_compressor.threshold_tokens * agent.context_compressor.summary_target_ratio
+    )
     assert agent._primary_runtime["compressor_context_length"] == 1_000_000
+
+
+
+def test_set_context_profile_updates_threshold_and_runtime():
+    agent = _build_agent()
+
+    new_context = agent.set_context_profile(
+        context_length=1_000_000,
+        compression_threshold=0.95,
+    )
+
+    assert new_context == 1_000_000
+    assert agent.context_length_override == 1_000_000
+    assert agent.context_compressor.context_length == 1_000_000
+    assert agent.context_compressor.threshold_percent == 0.95
+    assert agent.context_compressor.threshold_tokens == 950_000
+    assert agent.context_compressor.tail_token_budget == int(950_000 * agent.context_compressor.summary_target_ratio)
+    assert agent._primary_runtime["compressor_context_length"] == 1_000_000
+    assert agent._primary_runtime["compressor_threshold_percent"] == 0.95
 
 
 def test_switch_model_preserves_context_length_override():

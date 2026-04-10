@@ -240,7 +240,7 @@ Type these during an interactive chat session.
 /stop                Kill background processes
 /rollback [N]        Restore filesystem checkpoint
 /background <prompt> Run prompt in background
-/queue <prompt>      Queue for next turn
+/queue <prompt>      Queue for next turn (alias: /q)
 /resume [name]       Resume a named session
 ```
 
@@ -282,7 +282,7 @@ Type these during an interactive chat session.
 
 ### Exit
 ```
-/quit (/exit, /q)    Exit CLI
+/quit (/exit)        Exit CLI
 ```
 
 ---

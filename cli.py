@@ -263,7 +263,8 @@ def load_cli_config() -> Dict[str, Any]:
             "resume_display": "full",
             "show_reasoning": False,
             "streaming": True,
-            "busy_input_mode": "interrupt",
+            "fast_mode": False,
+            "busy_input_mode": "queue",
 
             "skin": "default",
         },
@@ -1246,9 +1247,9 @@ def save_config_value(key_path: str, value: any) -> bool:
     """
     Save a value to the active config file at the specified key path.
     
-    Respects the same lookup order as load_cli_config():
-    1. ~/.hermes/config.yaml (user config - preferred, used if it exists)
-    2. ./cli-config.yaml (project config - fallback)
+    Loads defaults using the same lookup order as load_cli_config(), but always
+    writes the result to ~/.hermes/config.yaml so first-run persistence does not
+    mutate the repo's cli-config.yaml.
     
     Args:
         key_path: Dot-separated path like "agent.system_prompt"
@@ -1257,18 +1258,19 @@ def save_config_value(key_path: str, value: any) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    # Use the same precedence as load_cli_config: user config first, then project config
     user_config_path = _hermes_home / 'config.yaml'
     project_config_path = Path(__file__).parent / 'cli-config.yaml'
-    config_path = user_config_path if user_config_path.exists() else project_config_path
+    source_path = user_config_path if user_config_path.exists() else project_config_path
+    config_path = user_config_path
     
     try:
         # Ensure parent directory exists (for ~/.hermes/config.yaml on first use)
         config_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Load existing config
-        if config_path.exists():
-            with open(config_path, 'r') as f:
+        # Load existing config from user config when present, otherwise seed
+        # from the project fallback before writing back to the user config path.
+        if source_path.exists():
+            with open(source_path, 'r') as f:
                 config = yaml.safe_load(f) or {}
         else:
             config = {}
@@ -1356,9 +1358,10 @@ class HermesCLI:
         self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
         # show_reasoning: display model thinking/reasoning before the response
         self.show_reasoning = CLI_CONFIG["display"].get("show_reasoning", False)
-        # busy_input_mode: "interrupt" (Enter interrupts current run) or "queue" (Enter queues for next turn)
-        _bim = CLI_CONFIG["display"].get("busy_input_mode", "interrupt")
-        self.busy_input_mode = "queue" if str(_bim).strip().lower() == "queue" else "interrupt"
+        # busy_input_mode: "queue" (Enter queues after the next tool call by default)
+        # or "interrupt" (Enter interrupts the current run immediately).
+        _bim = CLI_CONFIG["display"].get("busy_input_mode", "queue")
+        self.busy_input_mode = "interrupt" if str(_bim).strip().lower() == "interrupt" else "queue"
 
         self.verbose = verbose if verbose is not None else (self.tool_progress_mode == "verbose")
         
@@ -1415,11 +1418,18 @@ class HermesCLI:
         )
         self._provider_source: Optional[str] = None
         self.provider = self.requested_provider
+        from hermes_cli.context_limit import CONTEXT_MODE_DEFAULT, CONTEXT_MODE_PROFILES
+
         self.api_mode = "chat_completions"
         self.acp_command: Optional[str] = None
         self.acp_args: list[str] = []
-        self.codex_service_tier = None
-        self.context_length_override: Optional[int] = None
+        self.fast_mode_enabled = self._coerce_bool_setting(CLI_CONFIG["display"].get("fast_mode", False))
+        self.codex_service_tier = self._persistent_fast_service_tier()
+        _default_context_profile = CONTEXT_MODE_PROFILES[CONTEXT_MODE_DEFAULT]
+        self.context_length_override: Optional[int] = int(_default_context_profile["context_length"])
+        self.context_compaction_threshold: float = float(
+            _default_context_profile["compression_threshold"]
+        )
         self.base_url = (
             base_url
             or CLI_CONFIG["model"].get("base_url", "")
@@ -1616,6 +1626,61 @@ class HermesCLI:
         filled = round((safe_percent / 100) * width)
         return f"[{('█' * filled) + ('░' * max(0, width - filled))}]"
 
+    @staticmethod
+    def _coerce_bool_setting(value: Any) -> bool:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off", ""}:
+                return False
+        return bool(value)
+
+    def _persistent_fast_enabled(self) -> bool:
+        return self._coerce_bool_setting(getattr(self, "fast_mode_enabled", False))
+
+    def _persistent_fast_service_tier(self) -> Optional[str]:
+        return "fast" if self._persistent_fast_enabled() else None
+
+    def _fast_mode_active(self) -> bool:
+        return getattr(self, "codex_service_tier", None) == "fast"
+
+    def _set_fast_mode_runtime(self, enabled: bool) -> None:
+        self.codex_service_tier = "fast" if self._coerce_bool_setting(enabled) else None
+        if getattr(self, "agent", None):
+            self.agent.service_tier = self.codex_service_tier
+        if hasattr(self, "_invalidate"):
+            try:
+                self._invalidate(min_interval=0)
+            except Exception:
+                pass
+
+    def _set_fast_mode_enabled(self, enabled: bool, *, persist: bool = False) -> Optional[bool]:
+        enabled = self._coerce_bool_setting(enabled)
+        self.fast_mode_enabled = enabled
+
+        config = getattr(self, "config", None)
+        if isinstance(config, dict):
+            display_config = config.get("display")
+            if not isinstance(display_config, dict):
+                display_config = {}
+                config["display"] = display_config
+            display_config["fast_mode"] = enabled
+
+        try:
+            display_config = CLI_CONFIG.get("display")
+            if not isinstance(display_config, dict):
+                display_config = {}
+                CLI_CONFIG["display"] = display_config
+            display_config["fast_mode"] = enabled
+        except Exception:
+            pass
+
+        self._set_fast_mode_runtime(enabled)
+        if not persist:
+            return None
+        return save_config_value("display.fast_mode", enabled)
+
     def _current_context_limit(self) -> Optional[int]:
         agent = getattr(self, "agent", None)
         compressor = getattr(agent, "context_compressor", None) if agent else None
@@ -1624,6 +1689,78 @@ class HermesCLI:
             return int(context_length)
         override = getattr(self, "context_length_override", None)
         return int(override) if override else None
+
+    def _current_context_threshold(self) -> Optional[float]:
+        agent = getattr(self, "agent", None)
+        compressor = getattr(agent, "context_compressor", None) if agent else None
+        threshold_percent = getattr(compressor, "threshold_percent", None) if compressor else None
+        if threshold_percent is not None:
+            return float(threshold_percent)
+        threshold_percent = getattr(self, "context_compaction_threshold", None)
+        return float(threshold_percent) if threshold_percent is not None else None
+
+    def _current_context_mode(self) -> str:
+        from hermes_cli.context_limit import detect_context_mode
+
+        return (
+            detect_context_mode(
+                self._current_context_limit(),
+                self._current_context_threshold(),
+            )
+            or "custom"
+        )
+
+    def _set_session_context_profile(
+        self,
+        *,
+        context_length: int | None,
+        compression_threshold: float | None,
+    ) -> int:
+        if context_length is not None:
+            self.context_length_override = int(context_length)
+        if compression_threshold is not None:
+            self.context_compaction_threshold = float(compression_threshold)
+
+        applied = self.context_length_override or 0
+        if self.agent:
+            if hasattr(self.agent, "set_context_profile"):
+                applied = self.agent.set_context_profile(
+                    context_length=self.context_length_override,
+                    compression_threshold=self.context_compaction_threshold,
+                )
+            elif hasattr(self.agent, "set_context_length_override"):
+                applied = self.agent.set_context_length_override(self.context_length_override)
+
+        if hasattr(self, "_invalidate"):
+            self._invalidate()
+        return int(applied or 0)
+
+    def _print_context_profile_status(
+        self,
+        *,
+        context_mode: str,
+        context_length: int,
+        compression_threshold: float | None,
+    ) -> None:
+        _cprint(f"  {_GOLD}Context mode: {context_mode}{_RST}")
+        _cprint(f"  {_GOLD}Context limit: {context_length:,} tokens{_RST}")
+        if compression_threshold is not None:
+            threshold_tokens = int(context_length * compression_threshold)
+            _cprint(
+                "  "
+                f"{_DIM}Auto-compaction at {int(compression_threshold * 100)}% = "
+                f"{threshold_tokens:,} tokens{_RST}"
+            )
+        _cprint(f"  {_DIM}Session only — not saved to config. Resets on /new or /resume.{_RST}")
+
+    def _reset_session_context_mode(self) -> None:
+        from hermes_cli.context_limit import CONTEXT_MODE_DEFAULT, CONTEXT_MODE_PROFILES
+
+        profile = CONTEXT_MODE_PROFILES[CONTEXT_MODE_DEFAULT]
+        self._set_session_context_profile(
+            context_length=int(profile["context_length"]),
+            compression_threshold=float(profile["compression_threshold"]),
+        )
 
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         # Prefer the agent's model name — it updates on fallback.
@@ -1736,12 +1873,19 @@ class HermesCLI:
             percent = snapshot["context_percent"]
             percent_label = f"{percent}%" if percent is not None else "--"
             duration_label = snapshot["duration"]
+            fast_label = "⚡ fast" if self._fast_mode_active() else None
 
             if width < 52:
-                text = f"⚕ {snapshot['model_short']} · {duration_label}"
-                return self._trim_status_bar_text(text, width)
+                parts = [f"⚕ {snapshot['model_short']}"]
+                if fast_label:
+                    parts.append(fast_label)
+                parts.append(duration_label)
+                return self._trim_status_bar_text(" · ".join(parts), width)
             if width < 76:
-                parts = [f"⚕ {snapshot['model_short']}", percent_label]
+                parts = [f"⚕ {snapshot['model_short']}"]
+                if fast_label:
+                    parts.append(fast_label)
+                parts.append(percent_label)
                 parts.append(duration_label)
                 return self._trim_status_bar_text(" · ".join(parts), width)
 
@@ -1752,8 +1896,10 @@ class HermesCLI:
             else:
                 context_label = "ctx --"
 
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
-            parts.append(duration_label)
+            parts = [f"⚕ {snapshot['model_short']}"]
+            if fast_label:
+                parts.append(fast_label)
+            parts.extend([context_label, percent_label, duration_label])
             return self._trim_status_bar_text(" │ ".join(parts), width)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
@@ -1868,6 +2014,52 @@ class HermesCLI:
         except Exception:
             return 0
 
+    def _tool_boundary_payload_snapshot(self) -> list[Any]:
+        boundary_queue = getattr(self, '_tool_boundary_input_queue', None)
+        if boundary_queue is None:
+            return []
+
+        try:
+            with boundary_queue.mutex:
+                return [payload for payload in list(boundary_queue.queue) if payload]
+        except Exception:
+            payloads: list[Any] = []
+            while True:
+                try:
+                    payload = boundary_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if payload:
+                    payloads.append(payload)
+            for payload in payloads:
+                boundary_queue.put(payload)
+            return payloads
+
+    def _has_tool_boundary_followups(self) -> bool:
+        return bool(self._tool_boundary_payload_snapshot())
+
+    def _busy_followup_indicator_lines(self, *, max_items: int = 2, preview_limit: int = 88) -> list[str]:
+        payloads = self._tool_boundary_payload_snapshot()
+        if not payloads:
+            return []
+
+        term_cols = shutil.get_terminal_size((100, 20)).columns
+        effective_limit = max(24, min(preview_limit, max(24, term_cols - 8)))
+        header = "  Messages to be submitted after next tool call (Enter again to send now)"
+        displayed = payloads[:max_items]
+        lines = [header]
+        for idx, payload in enumerate(displayed):
+            branch = "└" if idx == len(displayed) - 1 and len(payloads) <= max_items else "├"
+            preview = self._preview_queued_payload(payload, limit=preview_limit)
+            wrapped = textwrap.wrap(preview, width=effective_limit, subsequent_indent="    ") or [preview]
+            lines.append(f"  {branch} {wrapped[0]}")
+            for continuation in wrapped[1:]:
+                lines.append(f"    {continuation}")
+        remaining = len(payloads) - len(displayed)
+        if remaining > 0:
+            lines.append(f"  └ +{remaining} more queued")
+        return lines
+
     def _flush_tool_boundary_queue_to_pending(self) -> list[Any]:
         boundary_queue = getattr(self, '_tool_boundary_input_queue', None)
         pending_queue = getattr(self, '_pending_input', None)
@@ -1911,10 +2103,26 @@ class HermesCLI:
                 pending_queue.put(payload)
             return False
 
+    def _submit_busy_empty_enter(self) -> str:
+        if getattr(self, 'busy_input_mode', 'queue') != 'queue':
+            return "noop"
+        if not self._has_tool_boundary_followups():
+            return "noop"
+        if self._promote_tool_boundary_input_to_interrupt():
+            _cprint("  Sending queued follow-up now")
+            try:
+                self._invalidate(min_interval=0)
+            except Exception:
+                pass
+            return "interrupt"
+        return "noop"
+
     def _agent_busy_placeholder_text(self) -> str:
-        if getattr(self, 'busy_input_mode', 'interrupt') == 'queue':
-            return "type a message + Enter to queue next turn, /q after tool, Ctrl+C to cancel"
-        return "type a message + Enter to interrupt, /q to queue message, Ctrl+C to cancel"
+        if getattr(self, 'busy_input_mode', 'queue') == 'queue':
+            if self._has_tool_boundary_followups():
+                return "queued for next tool call · Enter again to send now · Ctrl+C to cancel"
+            return "type a message + Enter to queue after the next tool call · Ctrl+C to cancel"
+        return "type a message + Enter to interrupt immediately · Ctrl+C to cancel"
 
     def _submit_busy_input(self, payload) -> str:
         """Route user input submitted while the agent is already generating."""
@@ -1943,8 +2151,23 @@ class HermesCLI:
             return "defer"
 
         if self.busy_input_mode == "queue":
-            self._pending_input.put(payload)
-            _cprint(f"  Queued for the next turn: {preview_short}")
+            self._queue_after_current_tool_boundary(payload)
+            agent = getattr(self, "agent", None)
+            tool_active = bool(
+                agent
+                and (
+                    getattr(agent, "_executing_tools", False)
+                    or getattr(agent, "_current_tool", None)
+                )
+            )
+            if tool_active:
+                _cprint(f"  Queued after the current tool call: {preview_short}")
+            else:
+                _cprint(f"  Queued for the next tool call boundary: {preview_short}")
+            try:
+                self._invalidate(min_interval=0)
+            except Exception:
+                pass
             return "queue"
 
         self._interrupt_queue.put(payload)
@@ -2052,8 +2275,7 @@ class HermesCLI:
 
     @staticmethod
     def _todo_kind_label(item: Dict[str, str]) -> str:
-        kind = str(item.get("kind") or "task").strip().lower()
-        return "review-loop" if kind == "review_loop" else "task"
+        return "task"
 
     @staticmethod
     def _todo_status_marker(item: Dict[str, str]) -> str:
@@ -2086,6 +2308,23 @@ class HermesCLI:
             return f"The current plan was cancelled ({cancelled} {noun})."
         return f"Plan closed: {completed}/{total} done · {cancelled} cancelled"
 
+    def _inline_plan_modal_blocker_active(self) -> bool:
+        return any(
+            getattr(self, attr, None) is not None
+            for attr in (
+                "_clarify_state",
+                "_approval_state",
+                "_sudo_state",
+                "_secret_state",
+                "_plan_popup_state",
+            )
+        )
+
+    def _should_show_inline_plan_widget(self) -> bool:
+        if self._inline_plan_modal_blocker_active():
+            return False
+        return bool(self._build_todo_plan_lines())
+
     def _build_todo_plan_lines(self, width: Optional[int] = None) -> list[tuple[str, str]]:
         try:
             items = self._get_todo_items()
@@ -2095,9 +2334,15 @@ class HermesCLI:
             if width is None:
                 try:
                     from prompt_toolkit.application import get_app
-                    width = get_app().output.get_size().columns
+                    size = get_app().output.get_size()
+                    width = size.columns
+                    term_rows = size.rows
                 except Exception:
-                    width = shutil.get_terminal_size((80, 24)).columns
+                    size = shutil.get_terminal_size((80, 24))
+                    width = size.columns
+                    term_rows = size.lines
+            else:
+                term_rows = shutil.get_terminal_size((80, 24)).lines
 
             content_width = max(1, int(width or 0))
             heading = "• Updated Plan" if self._todo_plan_recently_updated() else "• Current Plan"
@@ -2121,17 +2366,16 @@ class HermesCLI:
                 "cancelled": "plan-cancelled",
             }
 
-            max_visible_items = 6
+            max_rows = max(10, min(16, max(10, int(term_rows or 0) - 10)))
+            max_visible_items = max(8, max_rows - 2)
             visible_items = items[:max_visible_items]
             for item in visible_items:
                 status = str(item.get("status") or "pending")
                 marker = self._todo_status_marker(item)
                 style = styles.get(status, "plan-pending")
-                kind_label = self._todo_kind_label(item)
                 content = str(item.get("content") or item.get("id") or "(no description)").strip()
-                row = f"[{kind_label}] {content}"
                 for wrapped in self._wrap_display_text(
-                    row,
+                    content,
                     content_width,
                     initial_indent=f"  {marker} ",
                     subsequent_indent="    ",
@@ -2146,7 +2390,6 @@ class HermesCLI:
                     self._fit_display_line(f"  … +{hidden_items} more {noun}", content_width),
                 ))
 
-            max_rows = 8
             if len(lines) > max_rows:
                 hidden_lines = len(lines) - (max_rows - 1)
                 lines = lines[: max_rows - 1] + [
@@ -2181,46 +2424,43 @@ class HermesCLI:
         if width is None:
             try:
                 from prompt_toolkit.application import get_app
-                width = get_app().output.get_size().columns
+                size = get_app().output.get_size()
+                width = size.columns
+                term_rows = size.rows
             except Exception:
-                width = shutil.get_terminal_size((80, 24)).columns
-        content_width = max(24, min(72, int(width or 0) - 8))
+                size = shutil.get_terminal_size((80, 24))
+                width = size.columns
+                term_rows = size.lines
+        else:
+            term_rows = shutil.get_terminal_size((80, 24)).lines
+        content_width = max(24, min(88, int(width or 0) - 8))
         lines: list[tuple[str, str]] = []
 
         mode = state.get("mode", "browse")
         hint = {
-            "browse": "↑/↓ select · a add task · r add review loop · space done · i active · esc close",
+            "browse": "↑/↓ select · a add task · space done · i active · esc close",
             "add_task": "Add task — type the row text below and press Enter",
-            "add_review": "Add review loop — title | success criteria | reviewer note(optional)",
         }.get(mode, "esc close")
         for wrapped in self._wrap_display_text(hint, content_width, initial_indent="", subsequent_indent="  "):
             lines.append(("plan-popup-meta", wrapped))
 
         items = self._get_todo_items()
         if not items:
-            lines.append(("plan-popup-text", "(no plan blocks yet)"))
+            lines.append(("plan-popup-text", "(no plan items yet)"))
             return lines
 
         selected = max(0, min(int(state.get("selected", 0) or 0), len(items) - 1))
-        window_start = max(0, selected - 3)
-        visible = items[window_start:window_start + 7]
+        max_visible = max(9, min(14, max(9, int(term_rows or 0) - 10)))
+        window_start = max(0, min(selected - (max_visible // 2), max(0, len(items) - max_visible)))
+        visible = items[window_start:window_start + max_visible]
         for absolute_idx, item in enumerate(visible, start=window_start):
             prefix = "❯ " if absolute_idx == selected else "  "
             marker = self._todo_status_marker(item)
-            row = f"{prefix}{marker} [{self._todo_kind_label(item)}] {str(item.get('content') or item.get('id') or '(no description)').strip()}"
+            row = f"{prefix}{marker} {str(item.get('content') or item.get('id') or '(no description)').strip()}"
             style = "plan-popup-selected" if absolute_idx == selected else "plan-popup-text"
             for wrapped in self._wrap_display_text(row, content_width, initial_indent="", subsequent_indent="   "):
                 lines.append((style, wrapped))
 
-        item = items[selected]
-        criteria = str(item.get("success_criteria") or "").strip()
-        reviewer = str(item.get("reviewer_profile") or "").strip()
-        if criteria:
-            for wrapped in self._wrap_display_text(f"Expected: {criteria}", content_width, initial_indent="", subsequent_indent="  "):
-                lines.append(("plan-popup-meta", wrapped))
-        if reviewer:
-            for wrapped in self._wrap_display_text(f"Reviewer: {reviewer}", content_width, initial_indent="", subsequent_indent="  "):
-                lines.append(("plan-popup-meta", wrapped))
         return lines
 
     def _build_plan_snapshot_message(self, items: list[Dict[str, str]]) -> Optional[str]:
@@ -2477,32 +2717,16 @@ class HermesCLI:
         state = self._ensure_plan_popup_state()
         mode = state.get("mode", "browse")
         text = str(raw_text or "").strip()
-        if mode not in {"add_task", "add_review"} or not text:
+        if mode != "add_task" or not text:
             return False
 
         items = self._get_todo_items()
-        if mode == "add_review":
-            parts = [part.strip() for part in text.split("|")]
-            title = parts[0] if parts else text
-            criteria = parts[1] if len(parts) > 1 and parts[1] else "Delivered work matches the requested behavior and passes an independent review."
-            reviewer_note = parts[2] if len(parts) > 2 and parts[2] else ""
-            item = {
-                "id": self._slugify_todo_id(title, prefix="review"),
-                "content": title or "Review loop",
-                "status": "pending",
-                "kind": "review_loop",
-                "success_criteria": criteria,
-                "reviewer_profile": "gpt-5.4 reviewer",
-            }
-            if reviewer_note:
-                item["reviewer_prompt"] = reviewer_note
-        else:
-            item = {
-                "id": self._slugify_todo_id(text, prefix="task"),
-                "content": text,
-                "status": "pending",
-                "kind": "task",
-            }
+        item = {
+            "id": self._slugify_todo_id(text, prefix="task"),
+            "content": text,
+            "status": "pending",
+            "kind": "task",
+        }
 
         updated = list(items) + [item]
         self._rewrite_plan_items(updated)
@@ -2532,15 +2756,23 @@ class HermesCLI:
             except Exception:
                 width = shutil.get_terminal_size((80, 24)).columns
             duration_label = snapshot["duration"]
+            fast_label = "⚡ fast" if self._fast_mode_active() else None
 
             if width < 52:
                 frags = [
                     ("class:status-bar", " ⚕ "),
                     ("class:status-bar-strong", snapshot["model_short"]),
+                ]
+                if fast_label:
+                    frags.extend([
+                        ("class:status-bar-dim", " · "),
+                        ("class:status-bar-fast-key", fast_label),
+                    ])
+                frags.extend([
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
                     ("class:status-bar", " "),
-                ]
+                ])
             else:
                 percent = snapshot["context_percent"]
                 percent_label = f"{percent}%" if percent is not None else "--"
@@ -2548,12 +2780,19 @@ class HermesCLI:
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                    ]
+                    if fast_label:
+                        frags.extend([
+                            ("class:status-bar-dim", " · "),
+                            ("class:status-bar-fast-key", fast_label),
+                        ])
+                    frags.extend([
                         ("class:status-bar-dim", " · "),
                         (self._status_bar_context_style(percent), percent_label),
                         ("class:status-bar-dim", " · "),
                         ("class:status-bar-dim", duration_label),
                         ("class:status-bar", " "),
-                    ]
+                    ])
                 else:
                     if snapshot["context_length"]:
                         ctx_total = _format_context_length(snapshot["context_length"])
@@ -2566,6 +2805,13 @@ class HermesCLI:
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                    ]
+                    if fast_label:
+                        frags.extend([
+                            ("class:status-bar-dim", " │ "),
+                            ("class:status-bar-fast-key", fast_label),
+                        ])
+                    frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
                         ("class:status-bar-dim", " │ "),
@@ -2575,7 +2821,7 @@ class HermesCLI:
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
                         ("class:status-bar", " "),
-                    ]
+                    ])
 
             total_width = sum(self._status_bar_display_width(text) for _, text in frags)
             if total_width > width:
@@ -3261,6 +3507,10 @@ class HermesCLI:
                 tool_complete_callback=self._on_tool_complete,
                 stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
                 tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
+            )
+            self._set_session_context_profile(
+                context_length=self.context_length_override,
+                compression_threshold=self.context_compaction_threshold,
             )
             try:
                 local_store = getattr(self, "_local_todo_store", None)
@@ -4562,16 +4812,14 @@ class HermesCLI:
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
-        self.codex_service_tier = None
-        self.context_length_override = None
+        self.codex_service_tier = self._persistent_fast_service_tier()
+        self._reset_session_context_mode()
 
         if self.agent:
             self.agent.session_id = self.session_id
             self.agent.session_start = self.session_start
-            if hasattr(self.agent, "set_context_length_override"):
-                self.agent.set_context_length_override(None)
             self.agent.reset_session_state()
-            self.agent.service_tier = None
+            self.agent.service_tier = self.codex_service_tier
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = 0
             if hasattr(self.agent, "_todo_store"):
@@ -4642,8 +4890,8 @@ class HermesCLI:
         self.session_id = target_id
         self._resumed = True
         self._pending_title = None
-        self.codex_service_tier = None
-        self.context_length_override = None
+        self.codex_service_tier = self._persistent_fast_service_tier()
+        self._reset_session_context_mode()
 
         # Load conversation history (strip transcript-only metadata entries)
         restored = self._session_db.get_messages_as_conversation(target_id)
@@ -4662,10 +4910,8 @@ class HermesCLI:
         # Sync the agent if already initialised
         if self.agent:
             self.agent.session_id = target_id
-            if hasattr(self.agent, "set_context_length_override"):
-                self.agent.set_context_length_override(None)
             self.agent.reset_session_state()
-            self.agent.service_tier = None
+            self.agent.service_tier = self.codex_service_tier
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
             if hasattr(self.agent, "_todo_store"):
@@ -5670,8 +5916,8 @@ class HermesCLI:
             self._handle_resume_command(cmd_original)
         elif canonical == "model":
             self._handle_model_switch(cmd_original)
-        elif canonical == "context-limit":
-            self._handle_context_limit_command(cmd_original)
+        elif canonical == "context-mode":
+            self._handle_context_mode_command(cmd_original)
         elif canonical == "provider":
             self._show_model_and_providers()
         elif canonical == "prompt":
@@ -5710,6 +5956,8 @@ class HermesCLI:
             self._toggle_yolo()
         elif canonical == "fast":
             self._handle_fast_command(cmd_original)
+        elif canonical == "fast-temp":
+            self._handle_fast_temp_command(cmd_original)
         elif canonical == "reasoning":
             self._handle_reasoning_command(cmd_original)
         elif canonical == "compress":
@@ -5760,6 +6008,7 @@ class HermesCLI:
             payload = parts[1].strip() if len(parts) > 1 else ""
             if not payload:
                 _cprint("  Usage: /queue <prompt>")
+                _cprint("  Tip: use /quit or /exit to leave the current chat.")
             else:
                 preview = self._preview_queued_payload(payload)
                 if self._agent_running:
@@ -6442,17 +6691,23 @@ class HermesCLI:
             os.environ["HERMES_YOLO_MODE"] = "1"
             self.console.print("  ⚡ YOLO mode [bold green]ON[/] — all commands auto-approved. Use with caution.")
 
-    def _handle_fast_command(self, cmd: str):
-        """Handle /fast — session-local Codex fast mode."""
-        from hermes_cli.fast_mode import FAST_MODE_USAGE, fast_mode_note, parse_fast_command_arg
+    def _handle_fast_command_impl(self, cmd: str, *, explicit_temp: bool) -> None:
+        """Handle /fast and /fast-temp CLI commands."""
+        from hermes_cli.fast_mode import (
+            FAST_MODE_USAGE,
+            FAST_TEMP_MODE_USAGE,
+            fast_mode_note,
+            parse_fast_command_arg,
+        )
 
+        usage = FAST_TEMP_MODE_USAGE if explicit_temp else FAST_MODE_USAGE
         parts = cmd.strip().split(maxsplit=1)
         action = parse_fast_command_arg(parts[1] if len(parts) > 1 else "")
         if action is None:
-            _cprint(f"  {_DIM}Usage: {FAST_MODE_USAGE}{_RST}")
+            _cprint(f"  {_DIM}Usage: {usage}{_RST}")
             return
 
-        current_enabled = self.codex_service_tier == "fast"
+        current_enabled = self._fast_mode_active()
         if action == "status":
             enabled = current_enabled
         elif action == "toggle":
@@ -6460,10 +6715,12 @@ class HermesCLI:
         else:
             enabled = action == "on"
 
+        saved = None
         if action != "status":
-            self.codex_service_tier = "fast" if enabled else None
-            if self.agent:
-                self.agent.service_tier = self.codex_service_tier
+            if explicit_temp:
+                self._set_fast_mode_runtime(enabled)
+            else:
+                saved = self._set_fast_mode_enabled(enabled, persist=True)
 
         provider = getattr(self.agent, "provider", None) if self.agent else getattr(self, "provider", None)
         model = getattr(self.agent, "model", None) if self.agent else getattr(self, "model", None)
@@ -6472,31 +6729,57 @@ class HermesCLI:
         _cprint(f"  {_DIM}{fast_mode_note(provider=provider, model=model, enabled=enabled)}{_RST}")
         if action != "status":
             _cprint(f"  {_DIM}Takes effect on the next message.{_RST}")
+            if explicit_temp:
+                _cprint(f"  {_DIM}Session only — not saved to config. Resets on /new, /resume, or restart.{_RST}")
+            elif saved is False:
+                _cprint(f"  {_DIM}Warning: could not save config; current session updated only.{_RST}")
+            else:
+                _cprint(f"  {_DIM}Saved to config — persists across /new, /resume, and restart.{_RST}")
 
-    def _handle_context_limit_command(self, cmd: str):
-        """Handle /context-limit — session-local context window override."""
+    def _handle_fast_command(self, cmd: str):
+        """Handle /fast — persistent Codex fast mode."""
+        self._handle_fast_command_impl(cmd, explicit_temp=False)
+
+    def _handle_fast_temp_command(self, cmd: str):
+        """Handle /fast-temp — temporary Codex fast mode override."""
+        self._handle_fast_command_impl(cmd, explicit_temp=True)
+
+    def _handle_context_mode_command(self, cmd: str):
+        """Handle /context-mode — named session-local context profiles."""
         from hermes_cli.context_limit import (
-            CONTEXT_LIMIT_USAGE,
-            cycle_context_limit,
-            parse_context_limit_value,
+            CONTEXT_MODE_PROFILES,
+            CONTEXT_MODE_USAGE,
+            cycle_context_mode,
+            parse_context_mode_arg,
         )
 
         parts = cmd.strip().split(maxsplit=1)
-        if len(parts) > 1:
-            target = parse_context_limit_value(parts[1])
-            if target is None:
-                _cprint(f"  {_DIM}Usage: {CONTEXT_LIMIT_USAGE}{_RST}")
-                return
-        else:
-            target = cycle_context_limit(self._current_context_limit())
+        action = parse_context_mode_arg(parts[1] if len(parts) > 1 else "")
+        if action is None:
+            _cprint(f"  {_DIM}Usage: {CONTEXT_MODE_USAGE}{_RST}")
+            return
 
-        self.context_length_override = target
-        applied = target
-        if self.agent and hasattr(self.agent, "set_context_length_override"):
-            applied = self.agent.set_context_length_override(target)
+        if action == "status":
+            current_limit = self._current_context_limit() or self.context_length_override or 0
+            current_threshold = self._current_context_threshold()
+            self._print_context_profile_status(
+                context_mode=self._current_context_mode(),
+                context_length=int(current_limit),
+                compression_threshold=current_threshold,
+            )
+            return
 
-        _cprint(f"  {_GOLD}Context limit: {applied:,} tokens{_RST}")
-        _cprint(f"  {_DIM}Session only — resets on /new or /resume.{_RST}")
+        target_mode = cycle_context_mode(self._current_context_mode()) if action == "toggle" else action
+        profile = CONTEXT_MODE_PROFILES[target_mode]
+        applied = self._set_session_context_profile(
+            context_length=int(profile["context_length"]),
+            compression_threshold=float(profile["compression_threshold"]),
+        )
+        self._print_context_profile_status(
+            context_mode=target_mode,
+            context_length=applied,
+            compression_threshold=self.context_compaction_threshold,
+        )
 
     def _handle_reasoning_command(self, cmd: str):
         """Handle /reasoning — manage effort level and display toggle.
@@ -7362,6 +7645,7 @@ class HermesCLI:
             "question": question,
             "choices": choices if not is_open_ended else [],
             "selected": 0,
+            "scroll_offset": 0,
             "response_queue": response_queue,
         }
         self._clarify_deadline = _time.monotonic() + timeout
@@ -7409,6 +7693,166 @@ class HermesCLI:
             "The user did not provide a response within the time limit. "
             "Use your best judgement to make the choice and proceed."
         )
+
+    @staticmethod
+    def _wrap_panel_text_preserving_newlines(text: str, width: int, subsequent_indent: str = "") -> list[str]:
+        width = max(8, width)
+        logical_lines = str(text or "").splitlines() or [""]
+        wrapped_lines: list[str] = []
+        for logical_line in logical_lines:
+            if logical_line == "":
+                wrapped_lines.append("")
+                continue
+            wrapped = textwrap.wrap(
+                logical_line,
+                width=width,
+                break_long_words=False,
+                break_on_hyphens=False,
+                subsequent_indent=subsequent_indent,
+            )
+            wrapped_lines.extend(wrapped or [""])
+        return wrapped_lines or [""]
+
+    def _clarify_question_viewport_size(self) -> int:
+        state = self._clarify_state or {}
+        choices = state.get("choices") or []
+        term_rows = shutil.get_terminal_size((100, 20)).lines
+        reserved_lines = 5  # top, spacer, spacer, spacer, bottom
+        choice_line_count = 0
+        for idx, choice in enumerate(choices):
+            prefix = "❯ " if idx == state.get("selected", 0) and not self._clarify_freetext else "  "
+            choice_line_count += len(self._wrap_panel_text_preserving_newlines(f"{prefix}{choice}", 60, subsequent_indent="  "))
+        if choices:
+            other_label = (
+                "❯ Other (type below)" if self._clarify_freetext
+                else "❯ Other (type your answer)" if state.get("selected", 0) == len(choices)
+                else "  Other (type your answer)"
+            )
+            choice_line_count += len(self._wrap_panel_text_preserving_newlines(other_label, 60, subsequent_indent="  "))
+        elif self._clarify_freetext:
+            guidance = "Type your answer in the prompt below, then press Enter."
+            choice_line_count += len(self._wrap_panel_text_preserving_newlines(guidance, 60)) + 1
+        reserved_lines += choice_line_count
+        return max(3, term_rows - reserved_lines)
+
+    def _clarify_question_has_overflow(self) -> bool:
+        state = self._clarify_state or {}
+        question = state.get("question", "")
+        question_lines = self._wrap_panel_text_preserving_newlines(question, 60)
+        return len(question_lines) > self._clarify_question_viewport_size()
+
+    def _get_clarify_display_fragments(self):
+        """Build styled text for the clarify question/choices panel."""
+        state = self._clarify_state
+        if not state:
+            return []
+
+        question = state.get("question", "")
+        choices = state.get("choices") or []
+        selected = int(state.get("selected", 0) or 0)
+
+        def _panel_box_width(title: str, content_lines: list[str], min_width: int = 46, max_width: int = 76) -> int:
+            term_cols = shutil.get_terminal_size((100, 20)).columns
+            longest = max([len(title)] + [len(line) for line in content_lines] + [min_width - 4])
+            inner = min(max(longest + 4, min_width - 2), max_width - 2, max(24, term_cols - 6))
+            return inner + 2
+
+        def _append_panel_line(lines, border_style: str, content_style: str, text: str, box_width: int) -> None:
+            inner_width = max(0, box_width - 2)
+            lines.append((border_style, "│ "))
+            lines.append((content_style, text.ljust(inner_width)))
+            lines.append((border_style, " │\n"))
+
+        def _append_blank_panel_line(lines, border_style: str, box_width: int) -> None:
+            lines.append((border_style, "│" + (" " * box_width) + "│\n"))
+
+        preview_lines = self._wrap_panel_text_preserving_newlines(question, 60)
+        for idx, choice in enumerate(choices):
+            prefix = "❯ " if idx == selected and not self._clarify_freetext else "  "
+            preview_lines.extend(self._wrap_panel_text_preserving_newlines(f"{prefix}{choice}", 60, subsequent_indent="  "))
+        other_label = (
+            "❯ Other (type below)" if self._clarify_freetext
+            else "❯ Other (type your answer)" if selected == len(choices)
+            else "  Other (type your answer)"
+        )
+        if choices:
+            preview_lines.extend(self._wrap_panel_text_preserving_newlines(other_label, 60, subsequent_indent="  "))
+        if self._clarify_question_has_overflow():
+            preview_lines.extend(["▲ more above (PgUp)", "▼ more below (PgDn)"])
+
+        box_width = _panel_box_width("Hermes needs your input", preview_lines)
+        inner_text_width = max(8, box_width - 2)
+        question_lines = self._wrap_panel_text_preserving_newlines(question, inner_text_width)
+        viewport_size = self._clarify_question_viewport_size()
+        max_offset = max(0, len(question_lines) - 1)
+        scroll_offset = min(max(0, int(state.get("scroll_offset", 0) or 0)), max_offset)
+        state["scroll_offset"] = scroll_offset
+
+        if len(question_lines) <= viewport_size:
+            visible_question_lines = question_lines
+            has_above = False
+            has_below = False
+        else:
+            start = scroll_offset
+            for _ in range(3):
+                has_above = start > 0
+                tentative_end = min(len(question_lines), start + viewport_size)
+                has_below = tentative_end < len(question_lines)
+                content_capacity = max(1, viewport_size - int(has_above) - int(has_below))
+                start = min(scroll_offset, max(0, len(question_lines) - content_capacity))
+            has_above = start > 0
+            content_capacity = max(1, viewport_size - int(has_above))
+            end = min(len(question_lines), start + content_capacity)
+            has_below = end < len(question_lines)
+            content_capacity = max(1, viewport_size - int(has_above) - int(has_below))
+            end = min(len(question_lines), start + content_capacity)
+            has_below = end < len(question_lines)
+            visible_question_lines = question_lines[start:end]
+            state["scroll_offset"] = start
+
+        lines = []
+        lines.append(("class:clarify-border", "╭─ "))
+        lines.append(("class:clarify-title", "Hermes needs your input"))
+        lines.append(("class:clarify-border", " " + ("─" * max(0, box_width - len("Hermes needs your input") - 3)) + "╮\n"))
+        _append_blank_panel_line(lines, "class:clarify-border", box_width)
+
+        if has_above:
+            _append_panel_line(lines, "class:clarify-border", "class:clarify-choice", "▲ more above (PgUp)", box_width)
+        for wrapped in visible_question_lines:
+            _append_panel_line(lines, "class:clarify-border", "class:clarify-question", wrapped, box_width)
+        if has_below:
+            _append_panel_line(lines, "class:clarify-border", "class:clarify-choice", "▼ more below (PgDn)", box_width)
+        _append_blank_panel_line(lines, "class:clarify-border", box_width)
+
+        if self._clarify_freetext and not choices:
+            guidance = "Type your answer in the prompt below, then press Enter."
+            for wrapped in self._wrap_panel_text_preserving_newlines(guidance, inner_text_width):
+                _append_panel_line(lines, "class:clarify-border", "class:clarify-choice", wrapped, box_width)
+            _append_blank_panel_line(lines, "class:clarify-border", box_width)
+
+        if choices:
+            for idx, choice in enumerate(choices):
+                style = "class:clarify-selected" if idx == selected and not self._clarify_freetext else "class:clarify-choice"
+                prefix = "❯ " if idx == selected and not self._clarify_freetext else "  "
+                for wrapped in self._wrap_panel_text_preserving_newlines(f"{prefix}{choice}", inner_text_width, subsequent_indent="  "):
+                    _append_panel_line(lines, "class:clarify-border", style, wrapped, box_width)
+
+            other_idx = len(choices)
+            if selected == other_idx and not self._clarify_freetext:
+                other_style = "class:clarify-selected"
+                other_label = "❯ Other (type your answer)"
+            elif self._clarify_freetext:
+                other_style = "class:clarify-active-other"
+                other_label = "❯ Other (type below)"
+            else:
+                other_style = "class:clarify-choice"
+                other_label = "  Other (type your answer)"
+            for wrapped in self._wrap_panel_text_preserving_newlines(other_label, inner_text_width, subsequent_indent="  "):
+                _append_panel_line(lines, "class:clarify-border", other_style, wrapped, box_width)
+
+        _append_blank_panel_line(lines, "class:clarify-border", box_width)
+        lines.append(("class:clarify-border", "╰" + ("─" * box_width) + "╯\n"))
+        return lines
 
     def _sudo_password_callback(self) -> str:
         """
@@ -8060,9 +8504,9 @@ class HermesCLI:
 
             # Re-queue the interrupt message (and any that arrived while we were
             # processing the first) as the next prompt for process_loop.
-            # Only reached when busy_input_mode == "interrupt" (the default).
-            # In "queue" mode Enter routes directly to _pending_input so this
-            # block is never hit.
+            # Only reached when busy_input_mode == "interrupt".
+            # In "queue" mode Enter stages follow-ups for the next tool boundary,
+            # and a second empty Enter can promote the queued follow-up immediately.
             if pending_message and hasattr(self, '_pending_input'):
                 all_parts = [pending_message]
                 while not self._interrupt_queue.empty():
@@ -8508,17 +8952,22 @@ class HermesCLI:
                     event.app.invalidate()
                 return
 
-            # --- Plan popup entry mode: add a task or review loop block ---
-            if self._plan_popup_state and self._plan_popup_state.get("mode") in {"add_task", "add_review"}:
+            # --- Plan popup entry mode: add a task ---
+            if self._plan_popup_state and self._plan_popup_state.get("mode") == "add_task":
                 text = event.app.current_buffer.text.strip()
                 if self._plan_popup_commit_entry(text):
                     event.app.current_buffer.reset(append_to_history=False)
                 event.app.invalidate()
                 return
 
-            # --- Normal input routing ---
             text = event.app.current_buffer.text.strip()
             has_images = bool(self._attached_images)
+            if self._agent_running and not text and not has_images:
+                if self._submit_busy_empty_enter() != "noop":
+                    event.app.invalidate()
+                    return
+
+            # --- Normal input routing ---
             if text or has_images:
                 # Snapshot and clear attached images
                 images = list(self._attached_images)
@@ -8600,11 +9049,6 @@ class HermesCLI:
             self._plan_popup_start_entry("add_task")
             event.app.invalidate()
 
-        @kb.add('r', filter=_plan_popup_browse)
-        def plan_popup_add_review(event):
-            self._plan_popup_start_entry("add_review")
-            event.app.invalidate()
-
         @kb.add('space', filter=_plan_popup_browse)
         def plan_popup_toggle_done(event):
             self._plan_popup_toggle_selected_completed()
@@ -8618,7 +9062,7 @@ class HermesCLI:
         @kb.add('escape', filter=Condition(lambda: bool(self._plan_popup_state)))
         def plan_popup_escape(event):
             state = self._plan_popup_state or {}
-            if state.get("mode") in {"add_task", "add_review"}:
+            if state.get("mode") == "add_task":
                 state["mode"] = "browse"
                 event.app.current_buffer.reset()
                 event.app.invalidate()
@@ -8642,6 +9086,23 @@ class HermesCLI:
                 choices = self._clarify_state.get("choices") or []
                 max_idx = len(choices)  # last index is the "Other" option
                 self._clarify_state["selected"] = min(max_idx, self._clarify_state["selected"] + 1)
+                event.app.invalidate()
+
+        @kb.add('pageup', filter=Condition(lambda: bool(self._clarify_state)))
+        def clarify_pageup(event):
+            if self._clarify_state:
+                step = max(1, self._clarify_question_viewport_size() - 2)
+                current = int(self._clarify_state.get("scroll_offset", 0) or 0)
+                self._clarify_state["scroll_offset"] = max(0, current - step)
+                event.app.invalidate()
+
+        @kb.add('pagedown', filter=Condition(lambda: bool(self._clarify_state)))
+        def clarify_pagedown(event):
+            if self._clarify_state:
+                step = max(1, self._clarify_question_viewport_size() - 2)
+                current = int(self._clarify_state.get("scroll_offset", 0) or 0)
+                max_offset = max(0, len(self._wrap_panel_text_preserving_newlines(self._clarify_state.get("question", ""), 60)) - 1)
+                self._clarify_state["scroll_offset"] = min(max_offset, current + step)
                 event.app.invalidate()
 
         # --- Dangerous command approval: arrow-key navigation ---
@@ -9073,8 +9534,6 @@ class HermesCLI:
                 mode = cli_ref._plan_popup_state.get("mode", "browse")
                 if mode == "add_task":
                     return "new task text..."
-                if mode == "add_review":
-                    return "title | success criteria | reviewer note(optional)"
                 return "Ctrl+P to close the plan board"
             if cli_ref._command_running:
                 frame = cli_ref._command_spinner_frame()
@@ -9123,8 +9582,11 @@ class HermesCLI:
                         ('class:hint', '  type your answer and press Enter'),
                         ('class:clarify-countdown', countdown),
                     ]
+                hint_text = '  ↑/↓ to select, Enter to confirm'
+                if cli_ref._clarify_question_has_overflow():
+                    hint_text += ' · PgUp/PgDn scroll'
                 return [
-                    ('class:hint', '  ↑/↓ to select, Enter to confirm'),
+                    ('class:hint', hint_text),
                     ('class:clarify-countdown', countdown),
                 ]
 
@@ -9132,9 +9594,7 @@ class HermesCLI:
                 mode = cli_ref._plan_popup_state.get('mode', 'browse')
                 if mode == 'add_task':
                     return [('class:hint', '  add task · type text and press Enter')]
-                if mode == 'add_review':
-                    return [('class:hint', '  add review loop · title | success criteria | reviewer note(optional)')]
-                return [('class:hint', '  ↑/↓ move · a task · r review loop · space done · i active · Esc close')]
+                return [('class:hint', '  ↑/↓ move · a task · space done · i active · Esc close')]
 
             if cli_ref._command_running:
                 frame = cli_ref._command_spinner_frame()
@@ -9142,9 +9602,23 @@ class HermesCLI:
                     ('class:hint', f'  {frame} command in progress · input temporarily disabled'),
                 ]
 
+            if cli_ref._agent_running:
+                queued_lines = cli_ref._busy_followup_indicator_lines()
+                if queued_lines:
+                    fragments = []
+                    for idx, line in enumerate(queued_lines):
+                        fragments.append(('class:hint', line))
+                        if idx < len(queued_lines) - 1:
+                            fragments.append(('', '\n'))
+                    return fragments
+
             return []
 
         def get_hint_height():
+            if cli_ref._agent_running:
+                queued_lines = cli_ref._busy_followup_indicator_lines()
+                if queued_lines:
+                    return len(queued_lines)
             if cli_ref._sudo_state or cli_ref._secret_state or cli_ref._approval_state or cli_ref._clarify_state or cli_ref._plan_popup_state or cli_ref._command_running:
                 return 1
             # Keep a 1-line spacer while agent runs so output doesn't push
@@ -9199,71 +9673,7 @@ class HermesCLI:
             lines.append((border_style, "│" + (" " * box_width) + "│\n"))
 
         def _get_clarify_display():
-            """Build styled text for the clarify question/choices panel."""
-            state = cli_ref._clarify_state
-            if not state:
-                return []
-
-            question = state["question"]
-            choices = state.get("choices") or []
-            selected = state.get("selected", 0)
-            preview_lines = _wrap_panel_text(question, 60)
-            for i, choice in enumerate(choices):
-                prefix = "❯ " if i == selected and not cli_ref._clarify_freetext else "  "
-                preview_lines.extend(_wrap_panel_text(f"{prefix}{choice}", 60, subsequent_indent="  "))
-            other_label = (
-                "❯ Other (type below)" if cli_ref._clarify_freetext
-                else "❯ Other (type your answer)" if selected == len(choices)
-                else "  Other (type your answer)"
-            )
-            preview_lines.extend(_wrap_panel_text(other_label, 60, subsequent_indent="  "))
-            box_width = _panel_box_width("Hermes needs your input", preview_lines)
-            inner_text_width = max(8, box_width - 2)
-
-            lines = []
-            # Box top border
-            lines.append(('class:clarify-border', '╭─ '))
-            lines.append(('class:clarify-title', 'Hermes needs your input'))
-            lines.append(('class:clarify-border', ' ' + ('─' * max(0, box_width - len("Hermes needs your input") - 3)) + '╮\n'))
-            _append_blank_panel_line(lines, 'class:clarify-border', box_width)
-
-            # Question text
-            for wrapped in _wrap_panel_text(question, inner_text_width):
-                _append_panel_line(lines, 'class:clarify-border', 'class:clarify-question', wrapped, box_width)
-            _append_blank_panel_line(lines, 'class:clarify-border', box_width)
-
-            if cli_ref._clarify_freetext and not choices:
-                guidance = "Type your answer in the prompt below, then press Enter."
-                for wrapped in _wrap_panel_text(guidance, inner_text_width):
-                    _append_panel_line(lines, 'class:clarify-border', 'class:clarify-choice', wrapped, box_width)
-                _append_blank_panel_line(lines, 'class:clarify-border', box_width)
-
-            if choices:
-                # Multiple-choice mode: show selectable options
-                for i, choice in enumerate(choices):
-                    style = 'class:clarify-selected' if i == selected and not cli_ref._clarify_freetext else 'class:clarify-choice'
-                    prefix = '❯ ' if i == selected and not cli_ref._clarify_freetext else '  '
-                    wrapped_lines = _wrap_panel_text(f"{prefix}{choice}", inner_text_width, subsequent_indent="  ")
-                    for wrapped in wrapped_lines:
-                        _append_panel_line(lines, 'class:clarify-border', style, wrapped, box_width)
-
-                # "Other" option (5th line, only shown when choices exist)
-                other_idx = len(choices)
-                if selected == other_idx and not cli_ref._clarify_freetext:
-                    other_style = 'class:clarify-selected'
-                    other_label = '❯ Other (type your answer)'
-                elif cli_ref._clarify_freetext:
-                    other_style = 'class:clarify-active-other'
-                    other_label = '❯ Other (type below)'
-                else:
-                    other_style = 'class:clarify-choice'
-                    other_label = '  Other (type your answer)'
-                for wrapped in _wrap_panel_text(other_label, inner_text_width, subsequent_indent="  "):
-                    _append_panel_line(lines, 'class:clarify-border', other_style, wrapped, box_width)
-
-            _append_blank_panel_line(lines, 'class:clarify-border', box_width)
-            lines.append(('class:clarify-border', '╰' + ('─' * box_width) + '╯\n'))
-            return lines
+            return cli_ref._get_clarify_display_fragments()
 
         clarify_widget = ConditionalContainer(
             Window(
@@ -9434,7 +9844,7 @@ class HermesCLI:
                 height=lambda: cli_ref._get_todo_plan_height(),
                 wrap_lines=False,
             ),
-            filter=Condition(lambda: bool(cli_ref._build_todo_plan_lines()) and cli_ref._plan_popup_state is None),
+            filter=Condition(lambda: cli_ref._should_show_inline_plan_widget()),
         )
 
         status_bar = ConditionalContainer(
@@ -9494,6 +9904,7 @@ class HermesCLI:
             'status-bar': 'bg:#1a1a2e #C0C0C0',
             'status-bar-strong': 'bg:#1a1a2e #FFD700 bold',
             'status-bar-dim': 'bg:#1a1a2e #8B8682',
+            'status-bar-fast-key': 'bg:#1a1a2e #FFB347 bold',
             'status-bar-good': 'bg:#1a1a2e #8FBC8F bold',
             'status-bar-warn': 'bg:#1a1a2e #FFD700 bold',
             'status-bar-bad': 'bg:#1a1a2e #FF8C00 bold',

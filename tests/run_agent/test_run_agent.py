@@ -667,17 +667,28 @@ class TestHydrateTodoStore:
             agent._hydrate_todo_store(history)
         assert agent._todo_store.has_items()
 
-    def test_recovers_from_operator_plan_snapshot(self, agent):
+    def test_recovers_from_operator_plan_snapshot_and_normalizes_legacy_review_loop(self, agent):
         from tools.todo_tool import build_todo_snapshot_message
 
-        todos = [{"id": "review", "content": "Run reviewer", "status": "pending", "kind": "review_loop"}]
+        todos = [
+            {
+                "id": "review",
+                "content": "Run reviewer",
+                "status": "pending",
+                "kind": "review_loop",
+                "success_criteria": "Independent review passes",
+            },
+            {"id": "task", "content": "Implement fast mode", "status": "pending", "kind": "task"},
+        ]
         history = [
             {"role": "user", "content": build_todo_snapshot_message(todos)},
         ]
         with patch("run_agent._set_interrupt"):
             agent._hydrate_todo_store(history)
         assert agent._todo_store.has_items()
-        assert agent._todo_store.read()[0]["kind"] == "review_loop"
+        restored = agent._todo_store.read()
+        assert restored[0]["kind"] == "task"
+        assert "success_criteria" not in restored[0]
 
     def test_skips_non_todo_tools(self, agent):
         history = [
@@ -724,6 +735,27 @@ class TestBuildSystemPrompt:
 
         prompt = agent._build_system_prompt()
         assert MEMORY_GUIDANCE not in prompt
+
+    def test_todo_guidance_when_tool_loaded(self):
+        from agent.prompt_builder import TODO_GUIDANCE
+
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "todo"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent_with_todo = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        prompt = agent_with_todo._build_system_prompt()
+        assert TODO_GUIDANCE in prompt
 
     def test_hermes_docs_lookup_guidance_when_tool_loaded(self):
         from agent.prompt_builder import HERMES_DOCS_LOOKUP_GUIDANCE
@@ -1492,10 +1524,50 @@ class TestConcurrentToolExecution:
         assert {entry[0] for entry in completes} == {"c1", "c2"}
         assert {entry[3] for entry in completes} == {'{"id":1}', '{"id":2}'}
 
-    def test_invoke_tool_handles_agent_level_tools(self, agent):
-        """_invoke_tool should handle todo tool directly."""
+    def test_invoke_tool_requires_opt_in_for_new_todo_plan(self, agent):
+        """New todo plans should require explicit user opt-in."""
+        result = json.loads(agent._invoke_tool(
+            "todo",
+            {"todos": [{"id": "1", "content": "Do thing", "status": "pending"}]},
+            "task-1",
+        ))
+        assert result["approval_required"] is True
+        assert "ask the user" in result["error"].lower()
+
+    def test_invoke_tool_handles_agent_level_tools_after_explicit_request(self, agent):
+        """Explicit user plan requests should allow todo writes."""
+        agent._latest_user_message_text = "please make a plan first"
         with patch("tools.todo_tool.todo_tool", return_value='{"ok":true}') as mock_todo:
-            result = agent._invoke_tool("todo", {"todos": []}, "task-1")
+            result = agent._invoke_tool(
+                "todo",
+                {"todos": [{"id": "1", "content": "Do thing", "status": "pending"}]},
+                "task-1",
+            )
+            mock_todo.assert_called_once()
+        assert "ok" in result
+
+    def test_clarify_plan_opt_in_enables_followup_todo_write(self, agent):
+        approval_result = json.dumps({
+            "question": run_agent.TODO_OPT_IN_QUESTION,
+            "choices_offered": ["Yes — make a plan/todo", "No — work without one"],
+            "user_response": "Yes — make a plan/todo",
+        })
+        with patch("tools.clarify_tool.clarify_tool", return_value=approval_result):
+            agent._invoke_tool(
+                "clarify",
+                {
+                    "question": run_agent.TODO_OPT_IN_QUESTION,
+                    "choices": ["Yes — make a plan/todo", "No — work without one"],
+                },
+                "task-1",
+            )
+
+        with patch("tools.todo_tool.todo_tool", return_value='{"ok":true}') as mock_todo:
+            result = agent._invoke_tool(
+                "todo",
+                {"todos": [{"id": "1", "content": "Do thing", "status": "pending"}]},
+                "task-1",
+            )
             mock_todo.assert_called_once()
         assert "ok" in result
 

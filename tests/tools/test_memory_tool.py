@@ -229,6 +229,87 @@ class TestMemoryStoreSnapshot:
         assert store.format_for_system_prompt("memory") is None
 
 
+class TestMemoryStoreCompaction:
+    def test_build_compaction_proposal_lists_candidate_topics(self, store):
+        store.user_entries = [
+            "Prefer direct repo inspection/implementation; on resume re-check real state and inspect any user-named spec/doc/file first. Keep docs minimal to avoid drift.",
+            "Prefer GUI-first device setup guidance; prefer terminal/SSH-native UX for Hermes multi-agent features.",
+        ]
+
+        proposal = store.build_compaction_proposal(
+            "user",
+            "User prefers clarify-style approval before memory pruning.",
+            action="add",
+        )
+
+        assert proposal["success"] is True
+        assert proposal["target"] == "user"
+        assert proposal["candidates"]
+        assert any(c["topic"] for c in proposal["candidates"])
+        assert any(c["kind"] in {"shorten", "remove"} for c in proposal["candidates"])
+
+    def test_build_compaction_proposal_groups_entries_by_topic(self, store):
+        store.memory_entries = [
+            "Old Discord archive notes about launch metrics, emoji reactions, and weekend experiments.",
+            "Old Discord archive notes about retention charts, reaction experiments, and launch metrics.",
+            "ASI source of truth lives at /mnt/model-ssd/asi-terminal and uses two Dockerized vLLM lanes.",
+        ]
+
+        proposal = store.build_compaction_proposal(
+            "memory",
+            "Memory compaction flow now supports grouped topic deletion choices.",
+            action="add",
+        )
+
+        assert proposal["success"] is True
+        assert proposal["topic_groups"]
+        archive_group = next(group for group in proposal["topic_groups"] if group["entry_count"] >= 2)
+        assert archive_group["topic"]
+        assert archive_group["chars_freed_if_removed"] > 0
+        assert len(archive_group["entries"]) == archive_group["entry_count"]
+
+    def test_build_topic_group_selection_proposal_removes_selected_group_entries(self, store):
+        store.memory_entries = [
+            "Old Discord archive notes about launch metrics, emoji reactions, and weekend experiments.",
+            "Old Discord archive notes about retention charts, reaction experiments, and launch metrics.",
+            "ASI source of truth lives at /mnt/model-ssd/asi-terminal and uses two Dockerized vLLM lanes.",
+        ]
+
+        proposal = store.build_compaction_proposal(
+            "memory",
+            "Memory compaction flow now supports grouped topic deletion choices.",
+            action="add",
+        )
+        archive_group = next(group for group in proposal["topic_groups"] if group["entry_count"] >= 2)
+
+        selection = store.build_topic_group_selection_proposal("memory", proposal, [archive_group["id"]])
+
+        assert selection["success"] is True
+        assert selection["selected_group_ids"] == [archive_group["id"]]
+        assert selection["candidates"]
+        assert all(candidate["kind"] == "remove" for candidate in selection["candidates"])
+        assert {candidate["old_entry"] for candidate in selection["candidates"]} == set(archive_group["entries"])
+        assert selection["freed_chars"] >= archive_group["chars_freed_if_removed"]
+
+    def test_apply_compaction_proposal_reduces_usage(self, store):
+        store.user_entries = [
+            "Prefer direct repo inspection/implementation; on resume re-check real state and inspect any user-named spec/doc/file first. Keep docs minimal to avoid drift.",
+            "Prefer GUI-first device setup guidance; prefer terminal/SSH-native UX for Hermes multi-agent features.",
+        ]
+        before = store._char_count("user")
+        proposal = store.build_compaction_proposal(
+            "user",
+            "User prefers clarify-style approval before memory pruning.",
+            action="add",
+        )
+
+        result = store.apply_compaction_proposal("user", proposal)
+
+        assert result["success"] is True
+        assert store._char_count("user") < before
+        assert result["usage"]
+
+
 # =========================================================================
 # memory_tool() dispatcher
 # =========================================================================

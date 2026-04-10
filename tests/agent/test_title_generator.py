@@ -6,10 +6,26 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.title_generator import (
+    derive_title_from_text,
     generate_title,
     auto_title_session,
     maybe_auto_title,
 )
+
+
+class TestDeriveTitleFromText:
+    def test_strips_generic_change_scaffolding(self):
+        title = derive_title_from_text(
+            "make a simple change to the plan dismiss with h functionality where the plan auto-dismisses after 1 minute"
+        )
+        assert title == "Plan Dismiss With H"
+
+    def test_truncates_at_word_boundaries(self):
+        title = derive_title_from_text(
+            "debug the terminal title update flow when the first message should set a small preview title",
+            max_length=28,
+        )
+        assert title == "Terminal Title Update"
 
 
 class TestGenerateTitle:
@@ -52,17 +68,17 @@ class TestGenerateTitle:
             assert len(title) == 80
             assert title.endswith("...")
 
-    def test_returns_none_on_empty_response(self):
+    def test_falls_back_to_derived_title_on_empty_response(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = ""
 
         with patch("agent.title_generator.call_llm", return_value=mock_response):
-            assert generate_title("question", "answer") is None
+            assert generate_title("fix terminal title sync", "answer") == "Terminal Title Sync"
 
-    def test_returns_none_on_exception(self):
+    def test_falls_back_to_derived_title_on_exception(self):
         with patch("agent.title_generator.call_llm", side_effect=RuntimeError("no provider")):
-            assert generate_title("question", "answer") is None
+            assert generate_title("fix terminal title sync", "answer") == "Terminal Title Sync"
 
     def test_truncates_long_messages(self):
         """Long user/assistant messages should be truncated in the LLM request."""
@@ -104,6 +120,16 @@ class TestAutoTitleSession:
         with patch("agent.title_generator.generate_title", return_value="New Title"):
             auto_title_session(db, "sess-1", "hi", "hello")
             db.set_session_title.assert_called_once_with("sess-1", "New Title")
+
+    def test_calls_callback_after_setting_title(self):
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        callback = MagicMock()
+
+        with patch("agent.title_generator.generate_title", return_value="New Title"):
+            auto_title_session(db, "sess-1", "hi", "hello", on_title=callback)
+
+        callback.assert_called_once_with("New Title")
 
     def test_skips_if_generation_fails(self):
         db = MagicMock()
@@ -151,6 +177,21 @@ class TestMaybeAutoTitle:
             import time
             time.sleep(0.3)
             mock_auto.assert_called_once_with(db, "sess-1", "hello", "hi there")
+
+    def test_forwards_callback_on_first_exchange(self):
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        callback = MagicMock()
+        history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            maybe_auto_title(db, "sess-1", "hello", "hi there", history, on_title=callback)
+            import time
+            time.sleep(0.3)
+            mock_auto.assert_called_once_with(db, "sess-1", "hello", "hi there", on_title=callback)
 
     def test_skips_if_no_response(self):
         db = MagicMock()

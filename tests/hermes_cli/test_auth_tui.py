@@ -509,7 +509,7 @@ def test_render_pool_drain_meter_includes_title_stats_and_plot():
     assert "5h pool burn meter" in joined
     assert "drain 15.0 pool-%/h" in joined
     assert "drop 1/3" in joined
-    assert "auto 30s" in joined
+    assert "auto 30s all" in joined
     assert any("●" in line or "•" in line for line in lines)
 
 
@@ -530,7 +530,7 @@ def test_render_pool_drain_meter_formats_fractional_auto_refresh_seconds():
 
     lines = _render_pool_drain_meter([sample], width=58, height=8, auto_refresh_seconds=7.5)
 
-    assert "auto 7.5s" in "\n".join(lines)
+    assert "auto 7.5s all" in "\n".join(lines)
 
 
 def test_pool_drain_points_zoom_out_until_visible_window_fills():
@@ -658,21 +658,19 @@ def test_cycle_auto_refresh_interval_rotates_live_presets(monkeypatch):
 
     assert observed == [15.0, 10.0, 5.0, 2.5, 0.0, 60.0, 120.0, 30.0]
     assert tui._next_auto_refresh_at == 130.0
-    assert "Auto refresh" in tui.message
+    assert tui.message == "Auto refresh set to 30s for all Codex profiles."
 
 
-def test_auto_refresh_scope_uses_available_polling_but_forces_periodic_full_scans():
+def test_auto_refresh_scope_uses_unified_full_pool_polling():
     tui = CodexAuthTui(provider="openai-codex", timeout_seconds=3.0, kitty_meter=True, auto_refresh_interval_seconds=15.0)
     tui.loading = False
     tui._next_auto_refresh_at = 110.0
-    tui._next_full_refresh_at = 160.0
 
     assert tui._auto_refresh_scope_at(109.0) is None
-    assert tui._auto_refresh_scope_at(120.0) == "available"
-    assert tui._auto_refresh_scope_at(160.0) == "all"
+    assert tui._auto_refresh_scope_at(120.0) == "all"
 
     tui.auto_refresh_interval_seconds = 0.0
-    assert tui._auto_refresh_scope_at(170.0) == "all"
+    assert tui._auto_refresh_scope_at(170.0) is None
 
 
 def test_refresh_blocking_fetches_live_before_showing_rows(monkeypatch):
@@ -708,7 +706,7 @@ def test_refresh_blocking_fetches_live_before_showing_rows(monkeypatch):
     assert tui.message == "Loaded 1 live Codex profile."
 
 
-def test_fetch_live_snapshots_available_scope_polls_only_available_accounts(monkeypatch):
+def test_fetch_live_snapshots_auto_poll_refreshes_full_pool(monkeypatch):
     tui = CodexAuthTui(provider="openai-codex", timeout_seconds=3.0)
     tui.snapshots = [
         CodexProfileSnapshot(
@@ -737,10 +735,16 @@ def test_fetch_live_snapshots_available_scope_polls_only_available_accounts(monk
         ),
     ]
 
-    captured_entry_ids = []
+    captured_calls = []
 
-    def _fake_build(*, provider, timeout_seconds, entry_ids, fetch_profile=None):
-        captured_entry_ids.append(set(entry_ids))
+    def _fake_build(*, provider, timeout_seconds, entry_ids=None, fetch_profile=None):
+        captured_calls.append(
+            {
+                "provider": provider,
+                "timeout_seconds": timeout_seconds,
+                "entry_ids": entry_ids,
+            }
+        )
         return [
             CodexProfileSnapshot(
                 index=1,
@@ -758,15 +762,19 @@ def test_fetch_live_snapshots_available_scope_polls_only_available_accounts(monk
 
     monkeypatch.setattr("hermes_cli.auth_tui.build_codex_profile_snapshots", _fake_build)
 
-    snapshots, message, refresh_scope = tui._fetch_live_snapshots(refresh_scope="available")
+    snapshots, message, refresh_scope = tui._fetch_live_snapshots(refresh_scope="all")
 
-    assert captured_entry_ids == [{"avail-1"}]
-    assert refresh_scope == "available"
-    assert {snapshot.entry_id for snapshot in snapshots} == {"avail-1", "limit-1"}
-    merged = {snapshot.entry_id: snapshot for snapshot in snapshots}
-    assert merged["avail-1"].primary_window.used_percent == 35
-    assert merged["limit-1"].state == STATE_LIMITED
-    assert "available" in message.lower()
+    assert captured_calls == [
+        {
+            "provider": "openai-codex",
+            "timeout_seconds": 3.0,
+            "entry_ids": None,
+        }
+    ]
+    assert refresh_scope == "all"
+    assert [snapshot.entry_id for snapshot in snapshots] == ["avail-1"]
+    assert snapshots[0].primary_window.used_percent == 35
+    assert message == "Loaded 1 live Codex profile."
 
 
 def test_set_sort_mode_reorders_rows_and_preserves_selection():
