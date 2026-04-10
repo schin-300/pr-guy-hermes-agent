@@ -1357,6 +1357,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _MAX_CONCURRENT_RUNS = 10  # Prevent unbounded resource allocation
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
+    _RUN_EVENTS_KEEPALIVE = 1.0  # short keepalive so detach/disconnect is noticed quickly
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
@@ -1583,7 +1584,7 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             while True:
                 try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
+                    event = await asyncio.wait_for(q.get(), timeout=self._RUN_EVENTS_KEEPALIVE)
                 except asyncio.TimeoutError:
                     await response.write(b": keepalive\n\n")
                     continue
