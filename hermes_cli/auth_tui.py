@@ -535,9 +535,10 @@ def _pool_drain_plot_points_from_values(
             for index in range(len(visible))
         ]
     peak = max(max(visible, default=0.0), 1.5)
+    scale_max = max(1.5, peak * 1.12)
     points: list[tuple[int, int]] = []
     for x, value in zip(x_positions, visible):
-        normalized = value / peak if peak > 0 else 0.0
+        normalized = value / scale_max if scale_max > 0 else 0.0
         y = baseline_y - int(round(normalized * max_amplitude))
         points.append((x, max(min_y, min(max_y, y))))
     return points
@@ -585,8 +586,8 @@ def _render_pool_drain_meter(
     label = latest.label if latest else "5h"
     poll_interval_text = _format_poll_interval_seconds(auto_refresh_seconds)
     visible_polls = min(MAX_VISIBLE_POOL_DRAIN_POLLS, len(samples))
-    top = _meter_border_line(width, title=f"{label} pool burn meter", top=True)
-    bottom = _meter_border_line(width, title="rate history", top=False)
+    top = _meter_border_line(width, title=f"{label} pool burn rate", top=True)
+    bottom = _meter_border_line(width, title="recent polls", top=False)
     if latest is None:
         stat1 = _meter_text_line(width, "warming up — waiting for two live polls")
         stat2 = _meter_text_line(
@@ -642,14 +643,23 @@ def _render_pool_drain_meter(
     return [top, stat1, stat2, *graph_lines[:graph_height], bottom][:height]
 
 
-def _pool_drain_palette() -> tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]:
-    return (
-        (2, 9, 4),
-        (24, 126, 56),
-        (18, 90, 38),
-        (72, 255, 108),
-        (243, 255, 246),
-    )
+def _pool_drain_palette() -> dict[str, tuple[int, int, int]]:
+    return {
+        "background_top": (8, 13, 20),
+        "background_bottom": (5, 8, 13),
+        "frame": (50, 63, 82),
+        "frame_inner": (20, 29, 41),
+        "grid": (36, 50, 69),
+        "grid_soft": (24, 35, 49),
+        "baseline": (58, 82, 111),
+        "fill_top": (44, 161, 255),
+        "fill_bottom": (23, 92, 168),
+        "line_glow": (132, 216, 255),
+        "line": (92, 196, 255),
+        "line_core": (240, 248, 255),
+        "point_ring": (255, 189, 96),
+        "point_core": (255, 246, 227),
+    }
 
 
 def _mix_color(
@@ -758,6 +768,117 @@ def _draw_horizontal_band(
             _blend_pixel(pixels, width_px, height_px, x, band_y, color)
 
 
+def _draw_vertical_band(
+    pixels: bytearray,
+    width_px: int,
+    height_px: int,
+    x: int,
+    color: tuple[int, int, int, int],
+    *,
+    radius: int,
+    top: int = 0,
+    bottom: Optional[int] = None,
+) -> None:
+    if x < 0 or x >= width_px:
+        return
+    max_y = height_px - 1 if bottom is None else min(height_px - 1, bottom)
+    min_y = max(0, top)
+    for band_x in range(max(0, x - radius), min(width_px, x + radius + 1)):
+        for y in range(min_y, max_y + 1):
+            _blend_pixel(pixels, width_px, height_px, band_x, y, color)
+
+
+
+def _pool_drain_chart_bounds(width_px: int, height_px: int) -> tuple[int, int, int, int]:
+    left = 8
+    right = max(left + 4, width_px - 9)
+    top = max(6, round(height_px * 0.12))
+    baseline_y = max(top + 4, height_px - 1 - max(8, round(height_px * 0.14)))
+    return left, right, top, baseline_y
+
+
+
+def _curve_y_by_x(points: list[tuple[int, int]]) -> dict[int, int]:
+    if not points:
+        return {}
+    curve: dict[int, int] = {}
+    previous_x, previous_y = points[0]
+    curve[previous_x] = previous_y
+    for x, y in points[1:]:
+        steps = max(abs(x - previous_x), abs(y - previous_y), 1)
+        for step in range(steps + 1):
+            t = step / steps
+            draw_x = round(previous_x + ((x - previous_x) * t))
+            draw_y = round(previous_y + ((y - previous_y) * t))
+            existing = curve.get(draw_x)
+            if existing is None or draw_y < existing:
+                curve[draw_x] = draw_y
+        previous_x, previous_y = x, y
+    return curve
+
+
+
+def _fill_area_under_curve(
+    pixels: bytearray,
+    width_px: int,
+    height_px: int,
+    points: list[tuple[int, int]],
+    *,
+    baseline_y: int,
+    fill_top: tuple[int, int, int],
+    fill_bottom: tuple[int, int, int],
+) -> None:
+    curve = _curve_y_by_x(points)
+    if not curve:
+        return
+    min_x = min(curve)
+    max_x = max(curve)
+    current_y = curve[min_x]
+    for x in range(min_x, max_x + 1):
+        current_y = curve.get(x, current_y)
+        span = max(1, baseline_y - current_y)
+        for y in range(current_y, baseline_y + 1):
+            depth = (y - current_y) / span
+            color = _mix_color(fill_top, fill_bottom, min(1.0, depth * 1.15))
+            alpha = max(8, round(72 * (1.0 - (depth ** 0.78))))
+            _blend_pixel(pixels, width_px, height_px, x, y, (*color, alpha))
+
+
+
+def _draw_pool_drain_grid(
+    pixels: bytearray,
+    width_px: int,
+    height_px: int,
+    *,
+    left: int,
+    right: int,
+    top: int,
+    baseline_y: int,
+) -> None:
+    palette = _pool_drain_palette()
+    vertical_span = max(1, baseline_y - top)
+    for fraction, alpha in ((0.0, 30), (0.33, 24), (0.66, 24)):
+        y = round(top + (vertical_span * fraction))
+        _draw_horizontal_band(pixels, width_px, height_px, y, (*palette["grid_soft"], alpha), radius=0)
+    _draw_horizontal_band(pixels, width_px, height_px, baseline_y, (*palette["baseline"], 72), radius=0)
+    _draw_horizontal_band(pixels, width_px, height_px, baseline_y, (*palette["grid_soft"], 28), radius=1)
+
+    slot_positions = (0, 6, 12, 18, 24, MAX_VISIBLE_POOL_DRAIN_POLLS - 1)
+    slot_denominator = max(1, MAX_VISIBLE_POOL_DRAIN_POLLS - 1)
+    for slot in slot_positions:
+        x = left + round(((right - left) * slot) / slot_denominator)
+        _draw_vertical_band(
+            pixels,
+            width_px,
+            height_px,
+            x,
+            (*palette["grid_soft"], 22),
+            radius=0,
+            top=top,
+            bottom=baseline_y,
+        )
+
+
 def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     payload = chunk_type + data
     return struct.pack(">I", len(data)) + payload + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
@@ -776,45 +897,43 @@ def _encode_png_rgba(width_px: int, height_px: int, pixels: bytearray) -> bytes:
 
 
 def _fill_pool_drain_background(pixels: bytearray, width_px: int, height_px: int) -> None:
-    background, _border, _baseline, glow_color, _core = _pool_drain_palette()
-    center_y = (height_px - 1) / 2
+    palette = _pool_drain_palette()
     row_stride = width_px * 4
     for y in range(height_px):
-        distance = abs(y - center_y) / max(1.0, center_y)
-        haze = max(0.0, 1.0 - distance)
-        scanline = 0.92 if y % 2 else 1.0
-        red = round((background[0] + (glow_color[0] * 0.024 * haze)) * scanline)
-        green = round((background[1] + (glow_color[1] * 0.048 * haze)) * scanline)
-        blue = round((background[2] + (glow_color[2] * 0.02 * haze)) * scanline)
-        row = bytes((red, green, blue, 255)) * width_px
+        vertical_t = y / max(1, height_px - 1)
+        color = _mix_color(palette["background_top"], palette["background_bottom"], vertical_t)
+        row = bytes((*color, 255)) * width_px
         start = y * row_stride
         pixels[start : start + row_stride] = row
 
 
 def _draw_pool_drain_border(pixels: bytearray, width_px: int, height_px: int) -> None:
-    _background, border, _baseline, glow_color, _core = _pool_drain_palette()
-    bright = (*_mix_color(border, glow_color, 0.28), 255)
-    halo = (*glow_color, 34)
+    palette = _pool_drain_palette()
+    outer = (*palette["frame"], 255)
+    inner = (*palette["frame_inner"], 255)
     inset = 1
     for x in range(inset, width_px - inset):
-        _blend_pixel(pixels, width_px, height_px, x, inset, bright)
-        _blend_pixel(pixels, width_px, height_px, x, height_px - 1 - inset, bright)
-        if inset + 1 < height_px:
-            _blend_pixel(pixels, width_px, height_px, x, inset + 1, halo)
-            _blend_pixel(pixels, width_px, height_px, x, height_px - 2 - inset, halo)
+        _blend_pixel(pixels, width_px, height_px, x, inset, outer)
+        _blend_pixel(pixels, width_px, height_px, x, height_px - 1 - inset, outer)
     for y in range(inset, height_px - inset):
-        _blend_pixel(pixels, width_px, height_px, inset, y, bright)
-        _blend_pixel(pixels, width_px, height_px, width_px - 1 - inset, y, bright)
-        if inset + 1 < width_px:
-            _blend_pixel(pixels, width_px, height_px, inset + 1, y, halo)
-            _blend_pixel(pixels, width_px, height_px, width_px - 2 - inset, y, halo)
+        _blend_pixel(pixels, width_px, height_px, inset, y, outer)
+        _blend_pixel(pixels, width_px, height_px, width_px - 1 - inset, y, outer)
+
+    if width_px < 6 or height_px < 6:
+        return
+
+    inner_inset = inset + 1
+    for x in range(inner_inset, width_px - inner_inset):
+        _blend_pixel(pixels, width_px, height_px, x, inner_inset, inner)
+        _blend_pixel(pixels, width_px, height_px, x, height_px - 1 - inner_inset, inner)
+    for y in range(inner_inset, height_px - inner_inset):
+        _blend_pixel(pixels, width_px, height_px, inner_inset, y, inner)
+        _blend_pixel(pixels, width_px, height_px, width_px - 1 - inner_inset, y, inner)
 
 
 def _pool_drain_points(samples: list[CodexPoolDrainSample], *, width_px: int, height_px: int) -> list[tuple[int, int]]:
-    left = 8
-    right = max(left + 4, width_px - 9)
-    baseline_y = height_px // 2
-    max_amplitude = max(4, baseline_y - 8)
+    left, right, top, baseline_y = _pool_drain_chart_bounds(width_px, height_px)
+    max_amplitude = max(4, baseline_y - top)
     values = [max(0.0, sample.rate_percent_per_hour) for sample in samples] if samples else [0.0]
     return _pool_drain_plot_points_from_values(
         values,
@@ -822,8 +941,8 @@ def _pool_drain_points(samples: list[CodexPoolDrainSample], *, width_px: int, he
         right=right,
         baseline_y=baseline_y,
         max_amplitude=max_amplitude,
-        min_y=6,
-        max_y=max(6, height_px - 7),
+        min_y=top,
+        max_y=baseline_y,
     )
 
 
@@ -837,26 +956,46 @@ def _build_pool_drain_png_frame(
     _fill_pool_drain_background(pixels, width_px, height_px)
     _draw_pool_drain_border(pixels, width_px, height_px)
 
-    _background, _border, baseline, glow_color, core = _pool_drain_palette()
-    baseline_y = height_px // 2
-    baseline_color = _mix_color(baseline, glow_color, 0.24)
-    baseline_core = _mix_color(glow_color, core, 0.12)
-    _draw_horizontal_band(pixels, width_px, height_px, baseline_y, (*glow_color, 18), radius=6)
-    _draw_horizontal_band(pixels, width_px, height_px, baseline_y, (*baseline_color, 46), radius=2)
-    _draw_horizontal_band(pixels, width_px, height_px, baseline_y, (*baseline_core, 112), radius=0)
+    palette = _pool_drain_palette()
+    left, right, top, baseline_y = _pool_drain_chart_bounds(width_px, height_px)
+    _draw_pool_drain_grid(
+        pixels,
+        width_px,
+        height_px,
+        left=left,
+        right=right,
+        top=top,
+        baseline_y=baseline_y,
+    )
 
     points = _pool_drain_points(samples, width_px=width_px, height_px=height_px)
-    outer_glow = (*glow_color, 40)
-    mid_glow = (*glow_color, 96)
-    trace_color = (*_mix_color(glow_color, core, 0.42), 192)
-    core_color = (*core, 255)
-    _draw_polyline(pixels, width_px, height_px, points, outer_glow, radius=10)
-    _draw_polyline(pixels, width_px, height_px, points, mid_glow, radius=6)
-    _draw_polyline(pixels, width_px, height_px, points, trace_color, radius=3)
-    _draw_polyline(pixels, width_px, height_px, points, core_color, radius=1)
+    _fill_area_under_curve(
+        pixels,
+        width_px,
+        height_px,
+        points,
+        baseline_y=baseline_y,
+        fill_top=palette["fill_top"],
+        fill_bottom=palette["fill_bottom"],
+    )
+
+    _draw_polyline(pixels, width_px, height_px, points, (*palette["line_glow"], 28), radius=6)
+    _draw_polyline(pixels, width_px, height_px, points, (*palette["line"], 164), radius=2)
+    _draw_polyline(pixels, width_px, height_px, points, (*palette["line_core"], 255), radius=0)
     if points:
         cursor_x, cursor_y = points[-1]
-        _stamp_pixel(pixels, width_px, height_px, cursor_x, cursor_y, (*core, 255), radius=2)
+        _draw_vertical_band(
+            pixels,
+            width_px,
+            height_px,
+            cursor_x,
+            (*palette["grid"], 26),
+            radius=0,
+            top=top,
+            bottom=baseline_y,
+        )
+        _stamp_pixel(pixels, width_px, height_px, cursor_x, cursor_y, (*palette["point_ring"], 190), radius=4)
+        _stamp_pixel(pixels, width_px, height_px, cursor_x, cursor_y, (*palette["point_core"], 255), radius=2)
 
     return _encode_png_rgba(width_px, height_px, pixels)
 
@@ -1699,11 +1838,11 @@ class CodexAuthTui:
             visible_polls = min(MAX_VISIBLE_POOL_DRAIN_POLLS, len(self._pool_drain_history))
         if latest is None:
             return [
-                _clip("5h token burn monitor", width - 1),
+                _clip("5h pool burn rate", width - 1),
                 _clip("warming up — waiting for two live polls", width - 1),
             ]
         return [
-            _clip(f"{latest.label} token burn monitor", width - 1),
+            _clip(f"{latest.label} pool burn rate", width - 1),
             _clip(
                 (
                     f"drain {latest.rate_percent_per_hour:.1f} pool-%/h  •  drop {latest.dropping_accounts}/{latest.compared_accounts}  •  "
@@ -1927,9 +2066,12 @@ class CodexAuthTui:
             graph_summary_top = 1
             graph_summary_lines = self._graph_summary_lines(max_x) if graph_rows else []
             for line_offset, summary_line in enumerate(graph_summary_lines, start=graph_summary_top):
-                summary_attr = curses.A_BOLD if line_offset == graph_summary_top else curses.A_NORMAL
-                if curses.has_colors():
-                    summary_attr |= curses.color_pair(1 if line_offset > graph_summary_top else 4)
+                if line_offset == graph_summary_top:
+                    summary_attr = curses.A_BOLD
+                    if curses.has_colors():
+                        summary_attr |= curses.color_pair(4)
+                else:
+                    summary_attr = dim_attr
                 stdscr.addnstr(line_offset, 0, summary_line, max_x - 1, summary_attr)
 
             graph_top = graph_summary_top + len(graph_summary_lines)

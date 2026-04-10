@@ -506,7 +506,7 @@ def test_render_pool_drain_meter_includes_title_stats_and_plot():
 
     assert len(lines) == 8
     joined = "\n".join(lines)
-    assert "5h pool burn meter" in joined
+    assert "5h pool burn rate" in joined
     assert "drain 15.0 pool-%/h" in joined
     assert "drop 1/3" in joined
     assert "auto 30s all" in joined
@@ -556,6 +556,31 @@ def test_pool_drain_points_zoom_out_until_visible_window_fills():
     assert short_points[-1][0] == 151
     assert full_points[0][0] == 8
     assert full_points[-1][0] == 151
+
+
+def test_pool_drain_points_anchor_to_bottom_like_a_capacity_chart():
+    samples = [
+        CodexPoolDrainSample(
+            captured_at=float(idx),
+            label="5h",
+            rate_percent_per_hour=float(rate),
+            total_drop_percent=float(rate) / 2.0,
+            dropping_accounts=1,
+            compared_accounts=3,
+            tracked_accounts=4,
+            resetting_accounts=0,
+            average_available_percent=80.0,
+            total_available_percent=320.0,
+            total_capacity_percent=400.0,
+        )
+        for idx, rate in enumerate((2, 6, 12), start=1)
+    ]
+
+    points = _pool_drain_points(samples, width_px=160, height_px=96)
+
+    assert points[0][1] > 60
+    assert points[-1][1] < points[0][1]
+    assert max(y for _, y in points) <= 82
 
 
 def test_kitty_graphics_requested_requires_real_tty_unless_forced():
