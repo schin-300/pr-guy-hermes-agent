@@ -214,6 +214,7 @@ class GatewaySessionAgentProxy:
         wire_user_message = message_content_to_text(user_message)
         reasoning_text = ""
         streamed_chunks: list[str] = []
+        response_previewed = False
         final_response = ""
         failed = False
         interrupted = False
@@ -258,6 +259,7 @@ class GatewaySessionAgentProxy:
                         streamed_chunks.append(delta)
                         if stream_callback is not None:
                             stream_callback(delta)
+                            response_previewed = True
                 elif event_type == "reasoning.available":
                     reasoning_text = str(event.get("text") or "")
                     if reasoning_text and self.reasoning_callback is not None:
@@ -340,7 +342,7 @@ class GatewaySessionAgentProxy:
             "failed": failed,
             "interrupted": interrupted,
             "detached": detached,
-            "response_previewed": bool(streamed_chunks),
+            "response_previewed": response_previewed,
         }
         if reasoning_text:
             result["last_reasoning"] = reasoning_text

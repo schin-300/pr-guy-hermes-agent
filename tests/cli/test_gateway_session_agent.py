@@ -107,6 +107,7 @@ def test_run_conversation_streams_gateway_events_and_updates_usage():
     assert proxy.session_completion_tokens == 4
     assert proxy.session_total_tokens == 7
     assert proxy.session_api_calls == 1
+    assert result["response_previewed"] is True
 
     method, url, kwargs = fake_session.calls[0]
     assert method == "POST"
@@ -114,6 +115,29 @@ def test_run_conversation_streams_gateway_events_and_updates_usage():
     assert kwargs["json"]["session_id"] == "sess_1"
     assert kwargs["json"]["conversation_history"] == [{"role": "assistant", "content": "Earlier"}]
     assert kwargs["json"]["toolsets"] == ["terminal", "file"]
+
+
+def test_run_conversation_without_stream_callback_keeps_response_previewed_false():
+    events = [
+        'data: {"event":"message.delta","delta":"Hi"}',
+        'data: {"event":"message.delta","delta":" there"}',
+        'data: {"event":"run.completed","output":"Hi there","usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}',
+        ': stream closed',
+    ]
+    fake_session = _FakeSession(
+        run_response=_FakeResponse({"run_id": "run_123", "status": "started"}),
+        event_response=_FakeResponse(lines=events),
+    )
+    proxy = GatewaySessionAgentProxy(
+        endpoint=GatewaySessionEndpoint(base_url="http://127.0.0.1:8642", api_key=None),
+        session_id="sess_1",
+        http_session=fake_session,
+    )
+
+    result = proxy.run_conversation(user_message="Hello", conversation_history=[])
+
+    assert result["final_response"] == "Hi there"
+    assert result["response_previewed"] is False
 
 
 def test_interrupt_posts_run_cancel_and_closes_stream():
