@@ -65,6 +65,9 @@ Current implementation status on this branch
 - blocked-session proxy config + runtime exists
 - gateway can prompt to enable the proxy when a wait kind lacks config
 - gateway can use the proxy for blocked clarify/delegate meta-questions
+- gateway-backed CLI sessions now emit structured blocked-wait/activity events over the run SSE stream
+- gateway-backed CLI sessions can round-trip blocking clarify requests through the local interactive client
+- blocked-session helpers can target a named Hermes profile and launch through that profile's gateway runtime
 - normal free-text during delegate waits still falls through as steering/interruption
 
 Endgame

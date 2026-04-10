@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -5,6 +6,7 @@ import pytest
 from hermes_cli.gateway_session_client import (
     GatewaySessionClientError,
     GatewaySessionEndpoint,
+    ensure_gateway_session_bridge,
 )
 from hermes_cli.main import cmd_chat
 
@@ -66,3 +68,32 @@ def test_cmd_chat_interactive_exits_when_gateway_unavailable(monkeypatch):
         cmd_chat(_args())
 
     assert exc.value.code == 1
+
+
+def test_ensure_gateway_session_bridge_uses_target_profile_home(monkeypatch, tmp_path):
+    profile_home = tmp_path / "helper"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "platforms:\n  api_server:\n    extra:\n      host: 127.0.0.1\n      port: 9988\n      key: profile-key\n",
+        encoding="utf-8",
+    )
+
+    checks = []
+    launches = {}
+
+    def _fake_check(endpoint, timeout=1.5):
+        checks.append((endpoint.base_url, endpoint.api_key, timeout))
+        return len(checks) > 1
+
+    monkeypatch.setattr("hermes_cli.gateway_session_client.check_gateway_session_endpoint", _fake_check)
+    monkeypatch.setattr(
+        "hermes_cli.gateway.launch_gateway_background_for_home",
+        lambda hermes_home=None: launches.setdefault("home", Path(hermes_home).resolve()) or True,
+    )
+
+    endpoint = ensure_gateway_session_bridge(timeout=0.2, hermes_home=profile_home)
+
+    assert endpoint.base_url == "http://127.0.0.1:9988"
+    assert endpoint.api_key == "profile-key"
+    assert launches["home"] == profile_home.resolve()
+    assert checks[0][0] == "http://127.0.0.1:9988"

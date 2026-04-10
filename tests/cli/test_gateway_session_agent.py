@@ -43,16 +43,19 @@ class _BlockingResponse(_FakeResponse):
 
 
 class _FakeSession:
-    def __init__(self, *, run_response, event_response, cancel_response=None):
+    def __init__(self, *, run_response, event_response, cancel_response=None, clarify_response=None):
         self.run_response = run_response
         self.event_response = event_response
         self.cancel_response = cancel_response or _FakeResponse({"status": "cancelling"})
+        self.clarify_response = clarify_response or _FakeResponse({"status": "ok"})
         self.calls = []
 
     def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs))
         if url.endswith("/cancel"):
             return self.cancel_response
+        if url.endswith("/clarify"):
+            return self.clarify_response
         return self.run_response
 
     def get(self, url, **kwargs):
@@ -114,6 +117,37 @@ def test_run_conversation_streams_gateway_events_and_updates_usage():
     assert kwargs["json"]["session_id"] == "sess_1"
     assert kwargs["json"]["conversation_history"] == [{"role": "assistant", "content": "Earlier"}]
     assert kwargs["json"]["toolsets"] == ["terminal", "file"]
+
+
+def test_gateway_run_conversation_handles_clarify_request_and_activity_events():
+    events = [
+        'data: {"event":"agent.activity","activity":{"wait_state":{"kind":"delegate","mode":"wait"},"active_children_count":1,"active_children":[{"current_tool":"read_file"}]}}',
+        'data: {"event":"clarify.request","question":"Keep waiting?","choices":["Yes","No"]}',
+        'data: {"event":"run.completed","output":"done","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}',
+        ': stream closed',
+    ]
+    fake_session = _FakeSession(
+        run_response=_FakeResponse({"run_id": "run_123", "status": "started"}),
+        event_response=_FakeResponse(lines=events),
+    )
+    tool_events = []
+    clarify_requests = []
+    proxy = GatewaySessionAgentProxy(
+        endpoint=GatewaySessionEndpoint(base_url="http://127.0.0.1:8642", api_key=None),
+        session_id="sess_1",
+        http_session=fake_session,
+        tool_progress_callback=lambda event_type, name=None, preview=None, args=None, **kwargs: tool_events.append((event_type, kwargs.get("activity"))),
+        clarify_callback=lambda question, choices: clarify_requests.append((question, choices)) or "Yes",
+    )
+
+    result = proxy.run_conversation(user_message="hello", conversation_history=[])
+
+    assert result["final_response"] == "done"
+    assert clarify_requests == [("Keep waiting?", ["Yes", "No"])]
+    assert tool_events[0][0] == "agent.activity"
+    clarify_post = [call for call in fake_session.calls if call[0] == "POST" and call[1].endswith("/clarify")]
+    assert len(clarify_post) == 1
+    assert clarify_post[0][2]["json"] == {"response": "Yes"}
 
 
 def test_interrupt_posts_run_cancel_and_closes_stream():

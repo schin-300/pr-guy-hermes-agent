@@ -1,4 +1,5 @@
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -165,3 +166,69 @@ async def test_delegate_abort_request_is_handled_by_proxy_layer():
     assert handled is True
     assert "aborting" in response.lower()
     running_agent.interrupt.assert_called_once()
+
+
+def test_blocked_wait_proxy_uses_profile_gateway_runtime_when_configured(monkeypatch):
+    from agent import blocked_wait_proxy as proxy_mod
+
+    monkeypatch.setattr(
+        proxy_mod,
+        "load_blocked_wait_proxy_config",
+        lambda: {
+            "enabled": True,
+            "launcher": "gateway",
+            "profile": "helper",
+            "gateway_autostart": False,
+            "kinds": {"delegate": {"enabled": True, "instructions": "stay concise"}},
+        },
+    )
+
+    captured = {}
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.resolve_profile_env",
+        lambda profile_name: "/tmp/helper-profile",
+    )
+
+    def _fake_ensure(*, hermes_home=None, autostart=True, timeout=15.0):
+        captured["ensure"] = {
+            "hermes_home": Path(hermes_home).resolve() if hermes_home is not None else None,
+            "autostart": autostart,
+            "timeout": timeout,
+        }
+        return SimpleNamespace(base_url="http://127.0.0.1:8642", api_key=None)
+
+    class _FakeProxy:
+        def __init__(self, **kwargs):
+            captured["proxy_kwargs"] = kwargs
+
+        def run_conversation(self, user_message):
+            captured["user_message"] = user_message
+            return {"final_response": "proxy gateway answer"}
+
+    monkeypatch.setattr("hermes_cli.gateway_session_client.ensure_gateway_session_bridge", _fake_ensure)
+    monkeypatch.setattr("hermes_cli.gateway_session_client.GatewaySessionAgentProxy", _FakeProxy)
+
+    parent_agent = SimpleNamespace(
+        model="test-model",
+        provider="openrouter",
+        base_url=None,
+        api_key=None,
+        api_mode="chat_completions",
+        gateway_hosted_session=False,
+        platform="telegram",
+    )
+
+    response = proxy_mod.run_blocked_wait_proxy(
+        kind="delegate",
+        activity={"wait_state": {"kind": "delegate"}},
+        history=[{"role": "assistant", "content": "Working on it."}],
+        user_message="what is it doing?",
+        parent_agent=parent_agent,
+    )
+
+    assert response == "proxy gateway answer"
+    assert captured["ensure"]["hermes_home"] == Path("/tmp/helper-profile").resolve()
+    assert captured["ensure"]["autostart"] is False
+    assert captured["proxy_kwargs"]["enabled_toolsets"] == []
+    assert captured["user_message"] == "what is it doing?"

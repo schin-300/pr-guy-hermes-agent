@@ -222,22 +222,30 @@ def stop_profile_gateway() -> bool:
     return True
 
 
-def launch_gateway_background() -> bool:
-    """Launch the current profile's gateway as a detached background process."""
-    try:
-        from gateway.status import get_running_pid
-        if get_running_pid() is not None:
-            return True
-    except Exception:
-        pass
+def launch_gateway_background_for_home(hermes_home: str | Path | None = None) -> bool:
+    """Launch a profile's gateway as a detached background process.
 
-    logs_dir = get_hermes_home() / "logs"
+    When *hermes_home* is omitted, uses the current process HERMES_HOME.
+    """
+    target_home = Path(hermes_home or get_hermes_home()).expanduser().resolve()
+    current_home = get_hermes_home().resolve()
+
+    if target_home == current_home:
+        try:
+            from gateway.status import get_running_pid
+            if get_running_pid() is not None:
+                return True
+        except Exception:
+            pass
+
+    logs_dir = target_home / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / "gateway-autostart.log"
     log_handle = open(log_path, "a", encoding="utf-8")
 
     cmd = [sys.executable, "-m", "hermes_cli.main", "gateway", "run", "--replace", "--quiet"]
     env = os.environ.copy()
+    env["HERMES_HOME"] = str(target_home)
     popen_kwargs = {
         "stdin": subprocess.DEVNULL,
         "stdout": log_handle,
@@ -265,6 +273,11 @@ def launch_gateway_background() -> bool:
             pass
         print_warning(f"Could not auto-start the gateway in background. See {log_path}")
         return False
+
+
+def launch_gateway_background() -> bool:
+    """Launch the current profile's gateway as a detached background process."""
+    return launch_gateway_background_for_home(get_hermes_home())
 
 
 def is_linux() -> bool:

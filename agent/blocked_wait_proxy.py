@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import load_config, save_config
@@ -93,15 +95,70 @@ def identity_prompt(config: Optional[dict] = None) -> str:
     return str(cfg.get("identity_prompt") or DEFAULT_IDENTITY_PROMPT).strip()
 
 
-def helper_runtime(parent_agent, config: Optional[dict] = None) -> dict:
+def _kind_cfg(kind: str, config: Optional[dict] = None) -> dict:
+    cfg = config or load_blocked_wait_proxy_config()
+    kinds = cfg.get("kinds", {}) or {}
+    kind_cfg = kinds.get(kind, {}) or {}
+    return kind_cfg if isinstance(kind_cfg, dict) else {}
+
+
+
+def helper_profile(kind: str, config: Optional[dict] = None) -> str:
+    cfg = config or load_blocked_wait_proxy_config()
+    kind_cfg = _kind_cfg(kind, cfg)
+    return str(kind_cfg.get("profile") or cfg.get("profile") or "").strip()
+
+
+
+def helper_launcher(kind: str, parent_agent, config: Optional[dict] = None) -> str:
+    cfg = config or load_blocked_wait_proxy_config()
+    kind_cfg = _kind_cfg(kind, cfg)
+    raw = str(kind_cfg.get("launcher") or cfg.get("launcher") or "auto").strip().lower()
+    if raw not in {"auto", "direct", "gateway"}:
+        raw = "auto"
+    if raw == "auto":
+        if helper_profile(kind, cfg):
+            return "gateway"
+        if bool(getattr(parent_agent, "gateway_hosted_session", False)):
+            return "gateway"
+        return "direct"
+    return raw
+
+
+
+def helper_gateway_autostart(kind: str, config: Optional[dict] = None) -> bool:
+    cfg = config or load_blocked_wait_proxy_config()
+    kind_cfg = _kind_cfg(kind, cfg)
+    value = kind_cfg.get("gateway_autostart")
+    if value is None:
+        value = cfg.get("gateway_autostart", True)
+    return bool(value)
+
+
+
+def helper_runtime(kind: str, parent_agent, config: Optional[dict] = None) -> dict:
     cfg = config or load_blocked_wait_proxy_config()
     return {
+        "launcher": helper_launcher(kind, parent_agent, cfg),
+        "profile": helper_profile(kind, cfg),
+        "gateway_autostart": helper_gateway_autostart(kind, cfg),
         "model": str(cfg.get("model") or "").strip() or getattr(parent_agent, "model", ""),
         "provider": str(cfg.get("provider") or "").strip() or getattr(parent_agent, "provider", None),
         "base_url": str(cfg.get("base_url") or "").strip() or getattr(parent_agent, "base_url", None),
         "api_key": str(cfg.get("api_key") or "").strip() or getattr(parent_agent, "api_key", None),
         "api_mode": getattr(parent_agent, "api_mode", None),
     }
+
+
+
+def _helper_home_for_profile(profile_name: str) -> Optional[Path]:
+    if not profile_name:
+        return None
+    from hermes_cli.profiles import resolve_profile_env
+
+    resolved = resolve_profile_env(profile_name)
+    return Path(resolved).expanduser().resolve()
+
 
 
 def looks_like_meta_question(text: str) -> bool:
@@ -242,26 +299,51 @@ def run_blocked_wait_proxy(*, kind: str, activity: dict, history: List[Dict[str,
     from run_agent import AIAgent
 
     cfg = load_blocked_wait_proxy_config()
-    runtime = helper_runtime(parent_agent, cfg)
+    runtime = helper_runtime(kind, parent_agent, cfg)
     system_prompt = build_system_prompt(kind=kind, activity=activity, history=history, config=cfg)
 
-    helper = AIAgent(
-        model=runtime["model"],
-        provider=runtime["provider"],
-        base_url=runtime["base_url"],
-        api_key=runtime["api_key"],
-        api_mode=runtime["api_mode"],
-        max_iterations=2,
-        enabled_toolsets=[],
-        quiet_mode=True,
-        verbose_logging=False,
-        ephemeral_system_prompt=system_prompt,
-        skip_context_files=True,
-        skip_memory=True,
-        platform=getattr(parent_agent, "platform", None),
-    )
-    helper._print_fn = lambda *_a, **_kw: None
-    result = helper.run_conversation(user_message=user_message)
+    result: Any
+    launcher = runtime.get("launcher") or "direct"
+    if launcher == "gateway":
+        from hermes_cli.gateway_session_client import GatewaySessionAgentProxy, ensure_gateway_session_bridge
+
+        target_home = _helper_home_for_profile(str(runtime.get("profile") or ""))
+        endpoint = ensure_gateway_session_bridge(
+            hermes_home=target_home,
+            autostart=bool(runtime.get("gateway_autostart", True)),
+        )
+        helper = GatewaySessionAgentProxy(
+            endpoint=endpoint,
+            session_id=f"blocked-wait-{kind}-{uuid.uuid4().hex[:10]}",
+            model=runtime["model"],
+            provider=runtime["provider"],
+            base_url=runtime["base_url"],
+            api_key=runtime["api_key"],
+            api_mode=runtime["api_mode"],
+            enabled_toolsets=[],
+            quiet_mode=True,
+            verbose_logging=False,
+            ephemeral_system_prompt=system_prompt,
+        )
+        result = helper.run_conversation(user_message=user_message)
+    else:
+        helper = AIAgent(
+            model=runtime["model"],
+            provider=runtime["provider"],
+            base_url=runtime["base_url"],
+            api_key=runtime["api_key"],
+            api_mode=runtime["api_mode"],
+            max_iterations=2,
+            enabled_toolsets=[],
+            quiet_mode=True,
+            verbose_logging=False,
+            ephemeral_system_prompt=system_prompt,
+            skip_context_files=True,
+            skip_memory=True,
+            platform=getattr(parent_agent, "platform", None),
+        )
+        helper._print_fn = lambda *_a, **_kw: None
+        result = helper.run_conversation(user_message=user_message)
     response = (result or {}).get("final_response", "") if isinstance(result, dict) else str(result or "")
     response = re.sub(r"^\s*Hermes:\s*", "", response or "", flags=re.IGNORECASE)
     return response.strip()

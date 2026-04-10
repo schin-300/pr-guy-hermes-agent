@@ -443,6 +443,9 @@ DEFAULT_CONFIG = {
     # delegated work, approvals, etc.
     "blocked_wait_proxy": {
         "enabled": False,
+        "launcher": "auto",  # auto | direct | gateway
+        "profile": "",       # optional named Hermes profile for the helper runtime
+        "gateway_autostart": True,
         "model": "",
         "provider": "",
         "base_url": "",
@@ -451,10 +454,10 @@ DEFAULT_CONFIG = {
         "setup_prompt_timeout": 90,
         "identity_prompt": "",
         "kinds": {
-            "clarify": {"enabled": False, "instructions": ""},
-            "delegate": {"enabled": False, "instructions": ""},
-            "approval": {"enabled": False, "instructions": ""},
-            "update": {"enabled": False, "instructions": ""},
+            "clarify": {"enabled": False, "instructions": "", "launcher": "", "profile": ""},
+            "delegate": {"enabled": False, "instructions": "", "launcher": "", "profile": ""},
+            "approval": {"enabled": False, "instructions": "", "launcher": "", "profile": ""},
+            "update": {"enabled": False, "instructions": "", "launcher": "", "profile": ""},
         },
     },
 

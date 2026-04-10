@@ -285,6 +285,9 @@ def load_cli_config() -> Dict[str, Any]:
         },
         "blocked_wait_proxy": {
             "enabled": False,
+            "launcher": "auto",
+            "profile": "",
+            "gateway_autostart": True,
             "model": "",
             "provider": "",
             "base_url": "",
@@ -293,10 +296,10 @@ def load_cli_config() -> Dict[str, Any]:
             "setup_prompt_timeout": 90,
             "identity_prompt": "",
             "kinds": {
-                "clarify": {"enabled": False, "instructions": ""},
-                "delegate": {"enabled": False, "instructions": ""},
-                "approval": {"enabled": False, "instructions": ""},
-                "update": {"enabled": False, "instructions": ""},
+                "clarify": {"enabled": False, "instructions": "", "launcher": "", "profile": ""},
+                "delegate": {"enabled": False, "instructions": "", "launcher": "", "profile": ""},
+                "approval": {"enabled": False, "instructions": "", "launcher": "", "profile": ""},
+                "update": {"enabled": False, "instructions": "", "launcher": "", "profile": ""},
             },
         },
         "code_execution": {
@@ -2759,6 +2762,7 @@ class HermesCLI:
                     ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
                     tool_progress_callback=self._on_tool_progress,
                     reasoning_callback=self._current_reasoning_callback(),
+                    clarify_callback=self._clarify_callback,
                 )
             else:
                 self.agent = AIAgent(
@@ -6120,6 +6124,28 @@ class HermesCLI:
             marker = "⚠️" if event_type == "subagent.warning" else "💓"
             label = preview or function_name or "subagent active"
             self._spinner_text = f"{marker} {label}"
+            self._invalidate(min_interval=0)
+            return
+
+        if event_type == "agent.activity":
+            activity = kwargs.get("activity") or {}
+            wait_state = activity.get("wait_state") or {}
+            if wait_state:
+                kind = str(wait_state.get("kind") or "waiting")
+                mode = str(wait_state.get("mode") or "wait").upper()
+                question = str(wait_state.get("question_preview") or "").strip()
+                label = f"⏳ {kind} ({mode})"
+                if question:
+                    label += f": {question[:48]}"
+                self._spinner_text = label
+            elif activity.get("active_children_count"):
+                child = (activity.get("active_children") or [{}])[0]
+                child_desc = child.get("current_tool") or child.get("last_activity_desc") or "delegate active"
+                self._spinner_text = f"💓 {child_desc}"
+            else:
+                desc = activity.get("last_activity_desc") or activity.get("current_tool")
+                if desc:
+                    self._spinner_text = str(desc)
             self._invalidate(min_interval=0)
             return
 

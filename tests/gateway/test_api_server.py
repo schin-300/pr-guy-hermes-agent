@@ -12,7 +12,9 @@ Tests cover:
 - Error handling (invalid JSON, missing fields)
 """
 
+import asyncio
 import json
+import threading
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -225,6 +227,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+    app.router.add_post("/v1/runs/{run_id}/cancel", adapter._handle_cancel_run)
+    app.router.add_post("/v1/runs/{run_id}/clarify", adapter._handle_submit_run_clarify)
     return app
 
 
@@ -1053,6 +1059,48 @@ class TestRunsCancellation:
 
         assert seen["timeout"] == adapter._RUN_EVENTS_KEEPALIVE
         assert seen["timeout"] <= 1.0
+
+    @pytest.mark.asyncio
+    async def test_submit_run_clarify_resolves_pending_wait(self, adapter):
+        app = _create_app(adapter)
+        run_id = "run_clarify"
+        result_box = {}
+
+        def _waiter():
+            result_box["result"] = adapter._wait_for_run_clarify(
+                run_id=run_id,
+                question="Need input?",
+                choices=["Yes"],
+                push_event=lambda _event: None,
+            )
+
+        thread = threading.Thread(target=_waiter)
+        thread.start()
+        time.sleep(0.05)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/v1/runs/{run_id}/clarify", json={"response": "Yes"})
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["run_id"] == run_id
+            assert data["resolved"] == 1
+
+        thread.join(timeout=1)
+        assert thread.is_alive() is False
+        assert result_box["result"] == "Yes"
+
+    @pytest.mark.asyncio
+    async def test_run_event_callback_forwards_subagent_heartbeat(self, adapter):
+        import asyncio
+
+        run_id = "run_subagent_event"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_streams_created[run_id] = time.time()
+        cb = adapter._make_run_event_callback(run_id, asyncio.get_running_loop())
+        cb("subagent.heartbeat", preview="child active")
+        event = await asyncio.wait_for(adapter._run_streams[run_id].get(), timeout=1)
+        assert event["event"] == "subagent.heartbeat"
+        assert event["preview"] == "child active"
 
 
 # ---------------------------------------------------------------------------

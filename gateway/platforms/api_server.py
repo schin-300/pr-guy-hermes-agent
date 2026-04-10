@@ -9,6 +9,8 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/models                  — lists hermes-agent as an available model
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
+- POST /v1/runs/{run_id}/cancel    — interrupt an active structured run
+- POST /v1/runs/{run_id}/clarify   — submit a clarify response for a blocked run
 - GET  /health                     — health check
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
@@ -25,8 +27,10 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 try:
@@ -49,6 +53,14 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+
+
+@dataclass
+class _RunClarifyEntry:
+    question: str
+    choices: list[str]
+    event: threading.Event
+    result: Optional[str] = None
 
 
 def check_api_server_requirements() -> bool:
@@ -308,6 +320,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._response_store = ResponseStore()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        # Live agent refs for cancellation / activity polling: run_id -> [agent_or_none]
+        self._run_agents: Dict[str, list[Any]] = {}
+        # Pending clarify waits for structured runs: run_id -> queued clarify prompts
+        self._run_clarify_queues: Dict[str, list[_RunClarifyEntry]] = {}
+        self._run_clarify_lock = threading.Lock()
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
@@ -420,8 +437,70 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
 
+    def _resolve_run_clarify(self, run_id: str, response_text: str) -> int:
+        """Resolve the oldest pending clarify wait for a structured run."""
+        with self._run_clarify_lock:
+            queue = self._run_clarify_queues.get(run_id) or []
+            if not queue:
+                return 0
+            entry = queue.pop(0)
+            if not queue:
+                self._run_clarify_queues.pop(run_id, None)
+        entry.result = str(response_text)
+        entry.event.set()
+        return 1
+
+    def _clear_run_clarify(self, run_id: str, *, default_response: str) -> None:
+        with self._run_clarify_lock:
+            queue = list(self._run_clarify_queues.pop(run_id, []))
+        for entry in queue:
+            if entry.result is None:
+                entry.result = default_response
+            entry.event.set()
+
+    def _wait_for_run_clarify(
+        self,
+        *,
+        run_id: str,
+        question: str,
+        choices: Optional[list[str]],
+        push_event,
+        timeout_seconds: Optional[float] = None,
+    ) -> str:
+        entry = _RunClarifyEntry(
+            question=question,
+            choices=list(choices or []),
+            event=threading.Event(),
+        )
+        with self._run_clarify_lock:
+            self._run_clarify_queues.setdefault(run_id, []).append(entry)
+
+        push_event({
+            "event": "clarify.request",
+            "run_id": run_id,
+            "timestamp": time.time(),
+            "question": question,
+            "choices": list(choices or []),
+        })
+
+        resolved = entry.event.wait(timeout_seconds) if timeout_seconds and timeout_seconds > 0 else entry.event.wait()
+        if not resolved:
+            with self._run_clarify_lock:
+                queue = self._run_clarify_queues.get(run_id) or []
+                if entry in queue:
+                    queue.remove(entry)
+                if not queue:
+                    self._run_clarify_queues.pop(run_id, None)
+            return (
+                "The user did not provide a response within the time limit. "
+                "Use your best judgement to make the choice and proceed."
+            )
+        if entry.result is not None:
+            return entry.result
+        return "The clarify request was cancelled before the user responded."
+
     # ------------------------------------------------------------------
-    # Agent creation helper
+    # Agent creation / runtime resolution
     # ------------------------------------------------------------------
 
     def _create_agent(
@@ -430,6 +509,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
+        clarify_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -468,6 +548,7 @@ class APIServerAdapter(BasePlatformAdapter):
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
+            clarify_callback=clarify_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
         )
@@ -1389,6 +1470,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
                 })
+            elif event_type in {"subagent.heartbeat", "subagent.warning"}:
+                _push({
+                    "event": event_type,
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "tool": tool_name,
+                    "preview": preview,
+                })
             elif event_type == "reasoning.available":
                 _push({
                     "event": "reasoning.available",
@@ -1432,21 +1521,24 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = time.time()
 
+        def _push_run_event(event: Dict[str, Any]) -> None:
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, event)
+            except Exception:
+                logger.debug("[api_server] failed to enqueue event for %s", run_id, exc_info=True)
+
         event_cb = self._make_run_event_callback(run_id, loop)
 
         # Also wire stream_delta_callback so message.delta events flow through
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
                 return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, {
-                    "event": "message.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
-            except Exception:
-                pass
+            _push_run_event({
+                "event": "message.delta",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "delta": delta,
+            })
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
@@ -1495,15 +1587,68 @@ class APIServerAdapter(BasePlatformAdapter):
 
         session_id = body.get("session_id") or run_id
         ephemeral_system_prompt = instructions
+        agent_ref: list[Any] = [None]
 
         async def _run_and_close():
+            activity_task: Optional[asyncio.Task] = None
+            stop_activity = asyncio.Event()
             try:
+                def _clarify_cb(question: str, choices: Optional[list[str]]) -> str:
+                    agent = agent_ref[0]
+                    if agent is not None and hasattr(agent, "set_wait_state"):
+                        try:
+                            agent.set_wait_state(
+                                "clarify",
+                                mode="wait",
+                                question_preview=str(question or "")[:160],
+                                choices_count=len(choices or []),
+                            )
+                        except Exception:
+                            logger.debug("[api_server] failed to set clarify wait state", exc_info=True)
+                    try:
+                        return self._wait_for_run_clarify(
+                            run_id=run_id,
+                            question=str(question or ""),
+                            choices=list(choices or []),
+                            push_event=_push_run_event,
+                        )
+                    finally:
+                        if agent is not None and hasattr(agent, "clear_wait_state"):
+                            try:
+                                agent.clear_wait_state()
+                            except Exception:
+                                logger.debug("[api_server] failed to clear clarify wait state", exc_info=True)
+
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    clarify_callback=_clarify_cb,
                 )
+                agent_ref[0] = agent
+                self._run_agents[run_id] = agent_ref
+
+                async def _emit_activity() -> None:
+                    while not stop_activity.is_set():
+                        try:
+                            activity = await asyncio.to_thread(agent.get_activity_summary)
+                        except Exception:
+                            activity = None
+                        if activity is not None:
+                            _push_run_event({
+                                "event": "agent.activity",
+                                "run_id": run_id,
+                                "timestamp": time.time(),
+                                "activity": activity,
+                            })
+                        try:
+                            await asyncio.wait_for(stop_activity.wait(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            continue
+
+                activity_task = asyncio.create_task(_emit_activity())
+
                 def _run_sync():
                     r = agent.run_conversation(
                         user_message=user_message,
@@ -1518,7 +1663,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                q.put_nowait({
+                _push_run_event({
                     "event": "run.completed",
                     "run_id": run_id,
                     "timestamp": time.time(),
@@ -1527,16 +1672,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
-                try:
-                    q.put_nowait({
-                        "event": "run.failed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "error": str(exc),
-                    })
-                except Exception:
-                    pass
+                _push_run_event({
+                    "event": "run.failed",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "error": str(exc),
+                })
             finally:
+                stop_activity.set()
+                if activity_task is not None:
+                    activity_task.cancel()
+                    try:
+                        await activity_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                self._clear_run_clarify(
+                    run_id,
+                    default_response="The clarify request was cancelled before the user responded.",
+                )
+                self._run_agents.pop(run_id, None)
                 # Sentinel: signal SSE stream to close
                 try:
                     q.put_nowait(None)
@@ -1552,6 +1706,59 @@ class APIServerAdapter(BasePlatformAdapter):
             task.add_done_callback(self._background_tasks.discard)
 
         return web.json_response({"run_id": run_id, "status": "started"}, status=202)
+
+    async def _handle_cancel_run(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        agent_ref = self._run_agents.get(run_id)
+        if not agent_ref:
+            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+
+        agent = agent_ref[0] if agent_ref else None
+        if agent is not None and hasattr(agent, "interrupt"):
+            try:
+                agent.interrupt("Run cancelled by client")
+            except Exception:
+                logger.debug("[api_server] failed to interrupt run %s", run_id, exc_info=True)
+
+        self._clear_run_clarify(run_id, default_response="The clarify request was cancelled before the user responded.")
+        _push = self._run_streams.get(run_id)
+        if _push is not None:
+            try:
+                _push.put_nowait({
+                    "event": "run.cancelled",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "reason": "Run cancelled by client",
+                })
+            except Exception:
+                logger.debug("[api_server] failed to enqueue cancel event for %s", run_id, exc_info=True)
+
+        return web.json_response({"run_id": run_id, "status": "cancelling"}, status=202)
+
+    async def _handle_submit_run_clarify(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        response_text = str(body.get("response") or "").strip()
+        if not response_text:
+            return web.json_response(_openai_error("Missing 'response' field"), status=400)
+
+        resolved = self._resolve_run_clarify(run_id, response_text)
+        if not resolved:
+            return web.json_response(_openai_error(f"No pending clarify request for run: {run_id}", code="run_not_found"), status=404)
+
+        return web.json_response({"run_id": run_id, "resolved": resolved, "status": "ok"}, status=200)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
@@ -1616,6 +1823,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("[api_server] sweeping orphaned run %s", run_id)
                 self._run_streams.pop(run_id, None)
                 self._run_streams_created.pop(run_id, None)
+                self._run_agents.pop(run_id, None)
+                self._clear_run_clarify(
+                    run_id,
+                    default_response="The clarify request was cancelled before the user responded.",
+                )
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -1650,6 +1862,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._app.router.add_post("/v1/runs/{run_id}/cancel", self._handle_cancel_run)
+            self._app.router.add_post("/v1/runs/{run_id}/clarify", self._handle_submit_run_clarify)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

@@ -733,9 +733,13 @@ clarify:
 # =============================================================================
 # Optional cheap continuity proxy for blocked waits (clarify, delegated work,
 # approvals, update prompts). Leave model/provider/base_url empty to inherit the
-# active Hermes runtime, or point them at a cheap local Qwen-style lane.
+# active Hermes runtime, point them at a cheap local Qwen-style lane, or route
+# the helper through a named Hermes profile's gateway runtime.
 blocked_wait_proxy:
   enabled: false
+  launcher: auto          # auto | direct | gateway
+  profile: ""             # optional named profile for the helper runtime
+  gateway_autostart: true
   context_char_budget: 32000
   setup_prompt_timeout: 90
   # model: "Qwen/Qwen3-4B-Instruct"
@@ -743,6 +747,11 @@ blocked_wait_proxy:
   # base_url: "http://127.0.0.1:8000/v1"
   # api_key: ""
   # identity_prompt: "You are the blocked-session continuity proxy for Hermes."
+  # kinds:
+  #   delegate:
+  #     enabled: true
+  #     profile: helper
+  #     launcher: gateway
   kinds:
     clarify:
       enabled: false

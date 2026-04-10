@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
@@ -13,9 +14,26 @@ import requests
 
 from gateway.config import Platform, load_gateway_config
 from gateway.platforms.api_server import DEFAULT_HOST, DEFAULT_PORT
-from run_agent import message_content_to_text
+from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
+
+
+def message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text" and item.get("text"):
+                    parts.append(str(item["text"]))
+                elif item.get("content"):
+                    parts.append(str(item["content"]))
+            elif item is not None:
+                parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    return "" if content is None else str(content)
 
 
 class GatewaySessionClientError(RuntimeError):
@@ -28,16 +46,62 @@ class GatewaySessionEndpoint:
     api_key: Optional[str] = None
 
 
-def resolve_gateway_session_endpoint() -> GatewaySessionEndpoint:
-    """Resolve the loopback API-server endpoint used for gateway-backed CLI sessions."""
-    config = load_gateway_config()
-    platform_cfg = config.platforms.get(Platform.API_SERVER)
-    extra = dict(getattr(platform_cfg, "extra", {}) or {})
+def _normalize_hermes_home(hermes_home: str | Path | None) -> Optional[Path]:
+    if hermes_home is None or str(hermes_home).strip() == "":
+        return None
+    return Path(hermes_home).expanduser().resolve()
 
-    host = str(os.getenv("API_SERVER_HOST") or extra.get("host") or DEFAULT_HOST)
-    port = int(os.getenv("API_SERVER_PORT") or extra.get("port") or DEFAULT_PORT)
-    api_key = os.getenv("API_SERVER_KEY") or extra.get("key") or None
+
+def _load_profile_api_server_settings(hermes_home: Path) -> tuple[str, int, Optional[str]]:
+    host = DEFAULT_HOST
+    port = DEFAULT_PORT
+    api_key: Optional[str] = None
+
+    gateway_json = hermes_home / "gateway.json"
+    if gateway_json.exists():
+        try:
+            data = json.loads(gateway_json.read_text(encoding="utf-8")) or {}
+            platform_cfg = dict((data.get("platforms") or {}).get(Platform.API_SERVER.value, {}) or {})
+            extra = dict(platform_cfg.get("extra") or {})
+            host = str(extra.get("host") or host)
+            port = int(extra.get("port") or port)
+            api_key = extra.get("key") or api_key
+        except Exception:
+            logger.debug("Failed to read %s", gateway_json, exc_info=True)
+
+    config_yaml = hermes_home / "config.yaml"
+    if config_yaml.exists():
+        try:
+            import yaml
+
+            yaml_cfg = yaml.safe_load(config_yaml.read_text(encoding="utf-8")) or {}
+            platform_cfg = dict((yaml_cfg.get("platforms") or {}).get(Platform.API_SERVER.value, {}) or {})
+            extra = dict(platform_cfg.get("extra") or {})
+            host = str(extra.get("host") or host)
+            port = int(extra.get("port") or port)
+            api_key = extra.get("key") or api_key
+        except Exception:
+            logger.debug("Failed to read %s", config_yaml, exc_info=True)
+
+    return host, port, api_key
+
+
+def resolve_gateway_session_endpoint(hermes_home: str | Path | None = None) -> GatewaySessionEndpoint:
+    """Resolve the loopback API-server endpoint used for gateway-backed CLI sessions."""
+    target_home = _normalize_hermes_home(hermes_home)
+    current_home = get_hermes_home().resolve()
+    if target_home is None or target_home == current_home:
+        config = load_gateway_config()
+        platform_cfg = config.platforms.get(Platform.API_SERVER)
+        extra = dict(getattr(platform_cfg, "extra", {}) or {})
+        host = str(os.getenv("API_SERVER_HOST") or extra.get("host") or DEFAULT_HOST)
+        port = int(os.getenv("API_SERVER_PORT") or extra.get("port") or DEFAULT_PORT)
+        api_key = os.getenv("API_SERVER_KEY") or extra.get("key") or None
+        return GatewaySessionEndpoint(base_url=f"http://{host}:{port}", api_key=api_key)
+
+    host, port, api_key = _load_profile_api_server_settings(target_home)
     return GatewaySessionEndpoint(base_url=f"http://{host}:{port}", api_key=api_key)
+
 
 
 def check_gateway_session_endpoint(endpoint: GatewaySessionEndpoint, timeout: float = 1.5) -> bool:
@@ -51,17 +115,22 @@ def check_gateway_session_endpoint(endpoint: GatewaySessionEndpoint, timeout: fl
     return payload.get("status") == "ok"
 
 
-def ensure_gateway_session_bridge(timeout: float = 15.0, autostart: bool = True) -> GatewaySessionEndpoint:
-    """Ensure the local gateway-backed session bridge is running and reachable."""
-    endpoint = resolve_gateway_session_endpoint()
+def ensure_gateway_session_bridge(
+    timeout: float = 15.0,
+    autostart: bool = True,
+    hermes_home: str | Path | None = None,
+) -> GatewaySessionEndpoint:
+    """Ensure the chosen profile's gateway-backed session bridge is running and reachable."""
+    target_home = _normalize_hermes_home(hermes_home)
+    endpoint = resolve_gateway_session_endpoint(target_home)
     if check_gateway_session_endpoint(endpoint):
         return endpoint
     if not autostart:
         raise GatewaySessionClientError("Gateway session bridge is not running")
 
-    from hermes_cli.gateway import launch_gateway_background
+    from hermes_cli.gateway import launch_gateway_background_for_home
 
-    if not launch_gateway_background():
+    if not launch_gateway_background_for_home(target_home or get_hermes_home()):
         raise GatewaySessionClientError("Failed to launch the Hermes gateway in the background")
 
     deadline = time.time() + max(timeout, 1.0)
@@ -97,6 +166,7 @@ class GatewaySessionAgentProxy:
         ephemeral_system_prompt: Optional[str] = None,
         tool_progress_callback: Optional[Callable[..., Any]] = None,
         reasoning_callback: Optional[Callable[[str], Any]] = None,
+        clarify_callback: Optional[Callable[[str, Optional[list[str]]], Any]] = None,
         http_session: Optional[requests.Session] = None,
     ):
         self.endpoint = endpoint
@@ -115,6 +185,7 @@ class GatewaySessionAgentProxy:
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.tool_progress_callback = tool_progress_callback
         self.reasoning_callback = reasoning_callback
+        self.clarify_callback = clarify_callback
         self.http_session = http_session or requests.Session()
 
         self.context_compressor = SimpleNamespace(
@@ -196,6 +267,15 @@ class GatewaySessionAgentProxy:
             raise GatewaySessionClientError("Gateway did not return a run_id")
         return str(run_id)
 
+    def _submit_clarify_response(self, run_id: str, response_text: str) -> None:
+        response = self.http_session.post(
+            f"{self.endpoint.base_url}/v1/runs/{run_id}/clarify",
+            json={"response": response_text},
+            headers=self._headers(),
+            timeout=30,
+        )
+        response.raise_for_status()
+
     def run_conversation(
         self,
         *,
@@ -262,10 +342,10 @@ class GatewaySessionAgentProxy:
                     reasoning_text = str(event.get("text") or "")
                     if reasoning_text and self.reasoning_callback is not None:
                         self.reasoning_callback(reasoning_text)
-                elif event_type == "tool.started":
+                elif event_type in {"tool.started", "subagent.heartbeat", "subagent.warning"}:
                     if self.tool_progress_callback is not None:
                         self.tool_progress_callback(
-                            "tool.started",
+                            event_type,
                             event.get("tool"),
                             event.get("preview"),
                             None,
@@ -280,6 +360,34 @@ class GatewaySessionAgentProxy:
                             duration=event.get("duration"),
                             is_error=event.get("error", False),
                         )
+                elif event_type == "agent.activity":
+                    if self.tool_progress_callback is not None:
+                        self.tool_progress_callback(
+                            "agent.activity",
+                            None,
+                            None,
+                            None,
+                            activity=event.get("activity") or {},
+                        )
+                elif event_type == "clarify.request":
+                    question = str(event.get("question") or "").strip()
+                    raw_choices = event.get("choices") or []
+                    choices = [str(choice) for choice in raw_choices] if isinstance(raw_choices, list) else None
+                    try:
+                        if self.clarify_callback is not None:
+                            clarify_result = self.clarify_callback(question, choices)
+                        else:
+                            clarify_result = (
+                                "The interactive client could not collect a clarify response. "
+                                "Use your best judgement to proceed."
+                            )
+                    except Exception as exc:
+                        logger.debug("Gateway clarify callback failed: %s", exc, exc_info=True)
+                        clarify_result = (
+                            "The interactive client could not collect a clarify response. "
+                            "Use your best judgement to proceed."
+                        )
+                    self._submit_clarify_response(run_id, str(clarify_result or "").strip())
                 elif event_type == "run.completed":
                     final_response = str(event.get("output") or "")
                     raw_usage = event.get("usage") or {}
