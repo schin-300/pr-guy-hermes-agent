@@ -20,6 +20,7 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
@@ -38,6 +39,8 @@ MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+HEARTBEAT_INTERVAL_SECONDS = 20.0
+HEARTBEAT_STALL_SECONDS = 75.0
 
 
 def check_delegate_requirements() -> bool:
@@ -135,16 +138,47 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
     # Gateway: batch tool names, flush periodically
     _BATCH_SIZE = 5
     _batch: List[str] = []
+    _state = {
+        "last_activity": time.monotonic(),
+        "last_label": "starting",
+    }
+
+    def _note_activity(label: Optional[str] = None) -> None:
+        _state["last_activity"] = time.monotonic()
+        if label:
+            _state["last_label"] = label
+
+    def _emit_heartbeat(elapsed_seconds: float, idle_seconds: float) -> None:
+        label = str(_state.get("last_label") or "working").strip() or "working"
+        message = f"{int(round(elapsed_seconds))}s"
+        if idle_seconds >= HEARTBEAT_STALL_SECONDS:
+            message += f" · idle {int(round(idle_seconds))}s"
+        message += f" · {label}"
+
+        if spinner:
+            try:
+                spinner.print_above(f" {prefix}├─ ⏱ {message}")
+            except Exception as e:
+                logger.debug("Spinner heartbeat failed: %s", e)
+        if parent_cb:
+            try:
+                parent_cb("subagent_progress", f"🔀 {prefix}⏱ {message}")
+            except Exception as e:
+                logger.debug("Parent heartbeat callback failed: %s", e)
 
     def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
         # event_type is one of: "tool.started", "tool.completed",
         # "reasoning.available", "_thinking", "subagent_progress"
+        if event_type not in {"tool.started", "tool.completed", "_thinking", "reasoning.available", "subagent_progress"} and tool_name is None:
+            tool_name = event_type
+            event_type = "tool.started"
 
         # "_thinking" / reasoning events
         if event_type in ("_thinking", "reasoning.available"):
             text = preview or tool_name or ""
+            short = (text[:55] + "...") if len(text) > 55 else text
+            _note_activity(short or "thinking")
             if spinner:
-                short = (text[:55] + "...") if len(text) > 55 else text
                 try:
                     spinner.print_above(f" {prefix}├─ 💭 \"{short}\"")
                 except Exception as e:
@@ -154,9 +188,13 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
 
         # tool.completed — no display needed here (spinner shows on started)
         if event_type == "tool.completed":
+            label = f"completed {tool_name}" if tool_name else "completed tool"
+            _note_activity(label)
             return
 
         # tool.started — display and batch for parent relay
+        label = tool_name or preview or "working"
+        _note_activity(label)
         if spinner:
             short = (preview[:35] + "...") if preview and len(preview) > 35 else (preview or "")
             from agent.display import get_tool_emoji
@@ -189,7 +227,15 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
                 logger.debug("Parent callback flush failed: %s", e)
             _batch.clear()
 
+    def _snapshot() -> Dict[str, Any]:
+        return {
+            "last_activity": float(_state.get("last_activity") or 0.0),
+            "last_label": str(_state.get("last_label") or "working"),
+        }
+
     _callback._flush = _flush
+    _callback._snapshot = _snapshot
+    _callback._emit_heartbeat = _emit_heartbeat
     return _callback
 
 
@@ -350,6 +396,8 @@ def _run_single_child(
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, 'tool_progress_callback', None)
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = None
 
     # Restore parent tool names using the value saved before child construction
     # mutated the global. This is the correct parent toolset, not the child's.
@@ -370,6 +418,29 @@ def _run_single_child(
                 logger.debug("Failed to bind child to leased credential: %s", exc)
 
     try:
+        if (
+            child_progress_cb
+            and hasattr(child_progress_cb, '_snapshot')
+            and hasattr(child_progress_cb, '_emit_heartbeat')
+        ):
+            def _heartbeat_loop() -> None:
+                while not heartbeat_stop.wait(HEARTBEAT_INTERVAL_SECONDS):
+                    try:
+                        snapshot = child_progress_cb._snapshot()
+                        now = time.monotonic()
+                        last_activity = float(snapshot.get("last_activity") or child_start)
+                        idle_seconds = max(0.0, now - last_activity)
+                        child_progress_cb._emit_heartbeat(now - child_start, idle_seconds)
+                    except Exception as exc:
+                        logger.debug("Subagent heartbeat failed: %s", exc)
+
+            heartbeat_thread = threading.Thread(
+                target=_heartbeat_loop,
+                daemon=True,
+                name=f"subagent-heartbeat-{task_index}",
+            )
+            heartbeat_thread.start()
+
         result = child.run_conversation(user_message=goal)
 
         # Flush any remaining batched progress to gateway
@@ -479,6 +550,13 @@ def _run_single_child(
         }
 
     finally:
+        heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            try:
+                heartbeat_thread.join(timeout=0.2)
+            except Exception:
+                pass
+
         if child_pool is not None and leased_cred_id is not None:
             try:
                 child_pool.release_lease(leased_cred_id)

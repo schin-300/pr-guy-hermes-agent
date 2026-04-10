@@ -13,21 +13,26 @@ import json
 import os
 import sys
 import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
+    HEARTBEAT_INTERVAL_SECONDS,
+    HEARTBEAT_STALL_SECONDS,
     MAX_CONCURRENT_CHILDREN,
     MAX_DEPTH,
     check_delegate_requirements,
     delegate_task,
     _build_child_agent,
+    _build_child_progress_callback,
     _build_child_system_prompt,
-    _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _run_single_child,
+    _strip_blocked_tools,
 )
 
 
@@ -553,6 +558,40 @@ class TestDelegateObservability(unittest.TestCase):
 
             result = json.loads(delegate_task(goal="Test max iter", parent_agent=parent))
             self.assertEqual(result["results"][0]["exit_reason"], "max_iterations")
+
+    def test_run_single_child_emits_heartbeat_updates(self):
+        """Long-running children should surface elapsed-time heartbeat updates."""
+        parent = _make_mock_parent(depth=0)
+        parent_cb = MagicMock()
+        parent.tool_progress_callback = parent_cb
+
+        cb = _build_child_progress_callback(0, parent)
+        child = MagicMock()
+        child.tool_progress_callback = cb
+        child._delegate_saved_tool_names = []
+        child._credential_pool = None
+        child.model = "claude-sonnet-4-6"
+        child.session_prompt_tokens = 10
+        child.session_completion_tokens = 5
+
+        def _slow_run_conversation(*_args, **_kwargs):
+            time.sleep(0.05)
+            return {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        child.run_conversation.side_effect = _slow_run_conversation
+
+        with patch("tools.delegate_tool.HEARTBEAT_INTERVAL_SECONDS", 0.01), patch("tools.delegate_tool.HEARTBEAT_STALL_SECONDS", 0.02):
+            entry = _run_single_child(0, "Long task", child=child, parent_agent=parent)
+
+        self.assertEqual(entry["status"], "completed")
+        heartbeat_calls = [call for call in parent_cb.call_args_list if call.args and call.args[0] == "subagent_progress" and "⏱" in call.args[1]]
+        self.assertTrue(heartbeat_calls)
 
 
 class TestBlockedTools(unittest.TestCase):

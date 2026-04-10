@@ -153,6 +153,28 @@ class TestBuildChildProgressCallback:
         
         parent_cb.assert_not_called()
 
+    def test_callback_exposes_snapshot_and_heartbeat_emit(self):
+        """Progress callback should track last activity and emit heartbeat lines."""
+        buf = io.StringIO()
+        spinner = KawaiiSpinner("delegating")
+        spinner._out = buf
+        spinner.running = True
+
+        parent = MagicMock()
+        parent._delegate_spinner = spinner
+        parent.tool_progress_callback = None
+
+        cb = _build_child_progress_callback(0, parent)
+        cb("tool.started", "web_search", "search arxiv", {})
+        snapshot = cb._snapshot()
+        assert snapshot["last_label"] == "web_search"
+        cb._emit_heartbeat(42.0, 5.0)
+
+        output = buf.getvalue()
+        assert "⏱" in output
+        assert "42s" in output
+        assert "web_search" in output
+
     def test_parallel_callbacks_independent(self):
         """Each child's callback should have independent batch state."""
         parent = MagicMock()
