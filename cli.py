@@ -1688,6 +1688,8 @@ class HermesCLI:
         self._active_agent_thread = None
         self._should_exit = False
         self._detaching_gateway_session = False
+        self._closing_gateway_session = False
+        self._launch_sessions_browser = False
         self._last_ctrl_c_time = 0
         self._clarify_state = None
         self._clarify_freetext = False
@@ -1746,6 +1748,49 @@ class HermesCLI:
             logger.debug("Failed to detach gateway session cleanly", exc_info=True)
         event.app.exit()
         return True
+
+    def _close_gateway_session_and_exit(self, event, *, message: str) -> bool:
+        """Explicitly close the current gateway-hosted session and exit the client."""
+        if not (self.gateway_session_mode and self.agent and hasattr(self.agent, "close_session")):
+            return False
+        self._closing_gateway_session = True
+        self._should_exit = True
+        print(f"\n{message}")
+        try:
+            self.agent.close_session()
+        except Exception:
+            logger.debug("Failed to close gateway session cleanly", exc_info=True)
+        event.app.exit()
+        return True
+
+    def _open_sessions_browser_and_exit(self, event, *, message: str) -> bool:
+        """Leave the current terminal client and exec into the session browser."""
+        if not self.gateway_session_mode:
+            return False
+        self._launch_sessions_browser = True
+        self._should_exit = True
+        print(f"\n{message}")
+        if self._agent_running and self.agent and hasattr(self.agent, "detach"):
+            try:
+                self.agent.detach()
+            except Exception:
+                logger.debug("Failed to detach before opening session browser", exc_info=True)
+        event.app.exit()
+        return True
+
+    def _exec_sessions_browser(self) -> None:
+        """Replace the current process with the interactive sessions browser."""
+        import shutil
+        hermes_bin = shutil.which("hermes")
+        if hermes_bin:
+            os.execvp(hermes_bin, ["hermes", "sessions", "browse"])
+        os.execvp(
+            sys.executable,
+            [sys.executable, "-m", "hermes_cli.main", "sessions", "browse"],
+        )
+
+    def _should_end_local_session_on_exit(self) -> bool:
+        return (not self.gateway_session_mode) or self._closing_gateway_session
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
@@ -10156,9 +10201,9 @@ class HermesCLI:
                 return
 
             if self._agent_running and self.agent:
-                if self._detach_gateway_session_and_exit(
+                if self._close_gateway_session_and_exit(
                     event,
-                    message="⚡ Detaching from gateway-hosted session...",
+                    message="⚡ Closing gateway-hosted session after saving...",
                 ):
                     return
                 if now - self._last_ctrl_c_time < 2.0:
@@ -10178,6 +10223,11 @@ class HermesCLI:
                     self._attached_images.clear()
                     event.app.invalidate()
                 else:
+                    if self._close_gateway_session_and_exit(
+                        event,
+                        message="⚡ Closing gateway-hosted session after saving...",
+                    ):
+                        return
                     self._should_exit = True
                     event.app.exit()
         
@@ -10222,13 +10272,17 @@ class HermesCLI:
 
         @kb.add(_voice_key)
         def handle_voice_record(event):
-            """Toggle voice recording when voice mode is active.
+            """Toggle voice recording, or open the sessions browser when voice mode is off.
 
             IMPORTANT: This handler runs in prompt_toolkit's event-loop thread.
             Any blocking call here (locks, sd.wait, disk I/O) freezes the
             entire UI.  All heavy work is dispatched to daemon threads.
             """
             if not cli_ref._voice_mode:
+                cli_ref._open_sessions_browser_and_exit(
+                    event,
+                    message="⚡ Opening session browser...",
+                )
                 return
             # Always allow STOPPING a recording (even when agent is running)
             if cli_ref._voice_recording:
@@ -11243,10 +11297,11 @@ class HermesCLI:
                     self._persist_active_session_on_exit()
                 except (Exception, KeyboardInterrupt) as e:
                     logger.debug("Could not backfill active session state on exit: %s", e)
-                try:
-                    self._session_db.end_session(self.agent.session_id, "cli_close")
-                except (Exception, KeyboardInterrupt) as e:
-                    logger.debug("Could not close session in DB: %s", e)
+                if self._should_end_local_session_on_exit():
+                    try:
+                        self._session_db.end_session(self.agent.session_id, "cli_close")
+                    except (Exception, KeyboardInterrupt) as e:
+                        logger.debug("Could not close session in DB: %s", e)
             # Plugin hook: on_session_end — safety net for interrupted exits.
             # run_conversation() already fires this per-turn on normal completion,
             # so only fire here if the agent was mid-turn (_agent_running) when
@@ -11265,6 +11320,8 @@ class HermesCLI:
                 except Exception:
                     pass
             _run_cleanup()
+            if self._launch_sessions_browser:
+                self._exec_sessions_browser()
             self._print_exit_summary()
 
 

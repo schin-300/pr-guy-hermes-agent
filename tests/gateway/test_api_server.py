@@ -229,6 +229,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/cancel", adapter._handle_cancel_run)
+    app.router.add_post("/v1/sessions/{session_id}/close", adapter._handle_close_session)
     return app
 
 
@@ -1023,6 +1024,21 @@ class TestRunsCancellation:
 
         assert seen["timeout"] == adapter._RUN_EVENTS_KEEPALIVE
         assert seen["timeout"] <= 1.0
+
+    @pytest.mark.asyncio
+    async def test_close_session_endpoint_marks_session_ended(self, adapter):
+        app = _create_app(adapter)
+        db = MagicMock()
+        adapter._session_db = db
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/sessions/sess_close_me/close")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["session_id"] == "sess_close_me"
+            assert data["status"] == "closed"
+
+        db.end_session.assert_called_once_with("sess_close_me", "user_close")
 
 
 # ---------------------------------------------------------------------------

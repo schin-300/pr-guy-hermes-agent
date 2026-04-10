@@ -385,6 +385,18 @@ class GatewaySessionAgentProxy:
             except Exception:
                 pass
 
+    def close_session(self) -> None:
+        with self._active_lock:
+            session_id = self.session_id
+
+        self.interrupt("Session closed by user")
+        response = self.http_session.post(
+            f"{self.endpoint.base_url}/v1/sessions/{session_id}/close",
+            headers=self._headers(),
+            timeout=10,
+        )
+        response.raise_for_status()
+
     def switch_model(
         self,
         *,

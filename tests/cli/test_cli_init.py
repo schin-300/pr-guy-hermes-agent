@@ -3,6 +3,7 @@ that only manifest at runtime (not in mocked unit tests)."""
 
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -368,3 +369,40 @@ class TestProviderResolution:
         cli = _make_cli()
         assert isinstance(cli.model, str)
         assert isinstance(cli.model, str) and '/' in cli.model
+
+
+class TestGatewayHostedSessionExitHelpers:
+    def test_close_gateway_session_helper_closes_and_exits(self):
+        cli = _make_cli(gateway_session_mode=True)
+        cli.agent = SimpleNamespace(close_session=MagicMock())
+        event = SimpleNamespace(app=SimpleNamespace(exit=MagicMock()))
+
+        result = cli._close_gateway_session_and_exit(event, message="bye")
+
+        assert result is True
+        assert cli._closing_gateway_session is True
+        cli.agent.close_session.assert_called_once()
+        event.app.exit.assert_called_once()
+
+    def test_open_sessions_browser_helper_detaches_running_session(self):
+        cli = _make_cli(gateway_session_mode=True)
+        cli._agent_running = True
+        cli.agent = SimpleNamespace(detach=MagicMock())
+        event = SimpleNamespace(app=SimpleNamespace(exit=MagicMock()))
+
+        result = cli._open_sessions_browser_and_exit(event, message="browser")
+
+        assert result is True
+        assert cli._launch_sessions_browser is True
+        cli.agent.detach.assert_called_once()
+        event.app.exit.assert_called_once()
+
+    def test_gateway_hosted_session_does_not_auto_close_on_plain_exit(self):
+        cli = _make_cli(gateway_session_mode=True)
+        cli._closing_gateway_session = False
+        assert cli._should_end_local_session_on_exit() is False
+
+    def test_gateway_hosted_session_does_close_on_explicit_ctrl_c_close(self):
+        cli = _make_cli(gateway_session_mode=True)
+        cli._closing_gateway_session = True
+        assert cli._should_end_local_session_on_exit() is True

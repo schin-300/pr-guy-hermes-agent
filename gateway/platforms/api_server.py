@@ -1616,6 +1616,25 @@ class APIServerAdapter(BasePlatformAdapter):
             status=202,
         )
 
+    async def _handle_close_session(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/close — mark a hosted session as closed."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+
+        try:
+            db.end_session(session_id, "user_close")
+        except Exception as exc:
+            logger.exception("[api_server] failed to close session %s", session_id)
+            return web.json_response(_openai_error(str(exc), err_type="server_error"), status=500)
+
+        return web.json_response({"session_id": session_id, "status": "closed"}, status=200)
+
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
         auth_err = self._check_auth(request)
@@ -1714,6 +1733,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/cancel", self._handle_cancel_run)
+            self._app.router.add_post("/v1/sessions/{session_id}/close", self._handle_close_session)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

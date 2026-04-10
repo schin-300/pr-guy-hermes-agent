@@ -167,3 +167,24 @@ def test_detach_closes_stream_without_cancelling_run():
     assert fake_stream.closed is True
     assert result_box["result"]["detached"] is True
     assert not any(call[1].endswith("/cancel") for call in fake_session.calls)
+
+
+def test_close_session_posts_close_endpoint_and_cancels_active_run():
+    fake_stream = _FakeResponse(lines=[])
+    fake_session = _FakeSession(
+        run_response=_FakeResponse({"run_id": "run_123", "status": "started"}),
+        event_response=fake_stream,
+    )
+    proxy = GatewaySessionAgentProxy(
+        endpoint=GatewaySessionEndpoint(base_url="http://127.0.0.1:8642", api_key=None),
+        session_id="sess_1",
+        http_session=fake_session,
+    )
+    proxy._active_run_id = "run_123"
+    proxy._active_events_response = fake_stream
+
+    proxy.close_session()
+
+    urls = [call[1] for call in fake_session.calls if call[0] == "POST"]
+    assert any(url.endswith("/v1/runs/run_123/cancel") for url in urls)
+    assert any(url.endswith("/v1/sessions/sess_1/close") for url in urls)
