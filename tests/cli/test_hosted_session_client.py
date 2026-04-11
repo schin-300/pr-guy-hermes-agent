@@ -212,3 +212,31 @@ def test_hosted_session_proxy_registers_live_session_and_can_switch_between_live
     assert proxy.session_id == "sess_2"
     assert fake_session.posts[-2]["url"].endswith("/v1/sessions/sess_1/detach")
     assert fake_session.posts[-1]["url"].endswith("/v1/sessions/sess_2/attach")
+
+
+def test_hosted_session_proxy_exposes_cli_compat_methods_for_session_switching():
+    fake_session = _FakeSession(
+        run_response=_FakeResponse({"run_id": "run_1", "session_id": "sess_1", "status": "started"}),
+        event_response=_FakeResponse(lines=[]),
+    )
+    proxy = HostedSessionAgentProxy(
+        endpoint=HostedSessionEndpoint(base_url="http://127.0.0.1:8642", api_key=None),
+        session_id="sess_1",
+        http_session=fake_session,
+    )
+
+    proxy.session_total_tokens = 99
+    proxy.session_input_tokens = 50
+    proxy.session_output_tokens = 49
+    proxy.session_api_calls = 3
+    assert proxy.set_context_length_override(12345) == 12345
+    assert proxy.context_compressor.context_length == 12345
+
+    proxy.reset_session_state()
+
+    assert proxy.session_total_tokens == 0
+    assert proxy.session_input_tokens == 0
+    assert proxy.session_output_tokens == 0
+    assert proxy.session_api_calls == 0
+    proxy.flush_memories([{"role": "user", "content": "hi"}], min_turns=0)
+    proxy._invalidate_system_prompt()

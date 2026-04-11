@@ -144,6 +144,7 @@ class HostedSessionAgentProxy:
         self.context_compressor = SimpleNamespace(
             context_length=context_length_override,
             threshold_percent=compression_threshold,
+            on_session_reset=lambda: None,
         )
         self.gateway_hosted_session = True
         self.compression_enabled = False
@@ -160,11 +161,18 @@ class HostedSessionAgentProxy:
         self.client_id = f"cli_{uuid.uuid4().hex}"
         self._attached = False
 
+        self.session_input_tokens = 0
+        self.session_output_tokens = 0
+        self.session_cache_read_tokens = 0
         self.session_cache_write_tokens = 0
         self.session_prompt_tokens = 0
         self.session_completion_tokens = 0
+        self.session_reasoning_tokens = 0
         self.session_total_tokens = 0
         self.session_api_calls = 0
+        self.session_estimated_cost_usd = 0.0
+        self.session_cost_status = "unknown"
+        self.session_cost_source = "none"
 
         self.attach_session()
 
@@ -423,6 +431,8 @@ class HostedSessionAgentProxy:
                 self._active_run_id = None
                 self._active_events_response = None
 
+        self.session_input_tokens += usage["input_tokens"]
+        self.session_output_tokens += usage["output_tokens"]
         self.session_prompt_tokens += usage["input_tokens"]
         self.session_completion_tokens += usage["output_tokens"]
         self.session_total_tokens += usage["total_tokens"]
@@ -484,6 +494,34 @@ class HostedSessionAgentProxy:
         )
         response.raise_for_status()
         self._attached = False
+
+    def reset_session_state(self) -> None:
+        self.session_total_tokens = 0
+        self.session_input_tokens = 0
+        self.session_output_tokens = 0
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.session_cache_read_tokens = 0
+        self.session_cache_write_tokens = 0
+        self.session_reasoning_tokens = 0
+        self.session_api_calls = 0
+        self.session_estimated_cost_usd = 0.0
+        self.session_cost_status = "unknown"
+        self.session_cost_source = "none"
+        if hasattr(self, "context_compressor") and self.context_compressor and hasattr(self.context_compressor, "on_session_reset"):
+            self.context_compressor.on_session_reset()
+
+    def set_context_length_override(self, context_length: Optional[int]) -> int:
+        self.context_length_override = int(context_length) if context_length else None
+        self.context_compressor.context_length = self.context_length_override
+        return self.context_length_override or 0
+
+    def _invalidate_system_prompt(self) -> None:
+        return None
+
+    def flush_memories(self, messages: Optional[list[dict[str, Any]]] = None, min_turns: Optional[int] = None) -> None:
+        del messages, min_turns
+        return None
 
     def switch_model(
         self,
