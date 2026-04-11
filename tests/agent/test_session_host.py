@@ -103,7 +103,7 @@ async def test_session_host_emits_subagent_progress():
     assert subagent_events[0]["payload"]["text"] == "child 1/2"
 
 
-def test_session_host_lists_live_attached_sessions_and_hides_detached_ones():
+def test_session_host_lists_detached_sessions_until_explicitly_closed():
     host = SessionHost()
 
     attached = host.attach_session(
@@ -121,4 +121,9 @@ def test_session_host_lists_live_attached_sessions_and_hides_detached_ones():
     assert rows[0]["title"] == "Live Session"
 
     assert host.detach_session("sess_live", client_id="cli_1") is True
+    rows_after_detach = host.list_sessions(live_only=True)
+    assert [row["id"] for row in rows_after_detach] == ["sess_live"]
+    assert rows_after_detach[0]["status"] == "detached"
+
+    assert host.close_session("sess_live") is True
     assert host.list_sessions(live_only=True) == []

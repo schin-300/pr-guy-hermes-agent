@@ -118,13 +118,14 @@ class SessionHost:
             if preview:
                 break
         title = str(session.metadata.get("title") or session.metadata.get("label") or "").strip() or None
+        status = "running" if run_is_live else ("attached" if session.attachments else "detached")
         return {
             "id": session.session_id,
             "title": title,
             "preview": preview,
             "source": "live",
             "last_active": session.last_active_at,
-            "status": "running" if run_is_live else ("attached" if session.attachments else "idle"),
+            "status": status,
             "active_run_id": session.active_run_id if run_is_live else None,
             "attached_clients": len(session.attachments),
             "model": session.metadata.get("model"),
@@ -171,16 +172,13 @@ class SessionHost:
         with self._lock:
             rows: list[dict[str, Any]] = []
             for session in self._sessions.values():
+                if session.closed:
+                    continue
                 summary = self._session_summary_locked(session)
-                is_live = bool(summary.get("active_run_id") or summary.get("attached_clients"))
-                if session.closed and not is_live:
-                    continue
-                if live_only and not is_live:
-                    continue
                 rows.append(summary)
 
-        status_rank = {"running": 0, "attached": 1, "idle": 2}
-        rows.sort(key=lambda row: (status_rank.get(str(row.get("status") or "idle"), 99), -(float(row.get("last_active") or 0.0))))
+        status_rank = {"running": 0, "attached": 1, "detached": 2}
+        rows.sort(key=lambda row: (status_rank.get(str(row.get("status") or "detached"), 99), -(float(row.get("last_active") or 0.0))))
         if limit is not None:
             try:
                 limit = max(int(limit), 0)

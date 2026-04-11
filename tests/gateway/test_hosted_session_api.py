@@ -162,7 +162,7 @@ async def test_close_session_endpoint_returns_404_for_missing_session():
 
 
 @pytest.mark.asyncio
-async def test_live_session_endpoints_track_attached_gateway_clients():
+async def test_live_session_endpoints_keep_detached_sessions_visible_until_closed():
     adapter = _make_adapter()
     app = _create_app(adapter)
 
@@ -186,4 +186,12 @@ async def test_live_session_endpoints_track_attached_gateway_clients():
         assert detach.status == 200
 
         live_after = await cli.get("/v1/sessions/live")
-        assert (await live_after.json())["sessions"] == []
+        rows_after = (await live_after.json())["sessions"]
+        assert [row["id"] for row in rows_after] == ["sess_live"]
+        assert rows_after[0]["status"] == "detached"
+
+        close = await cli.post("/v1/sessions/sess_live/close")
+        assert close.status == 200
+
+        live_closed = await cli.get("/v1/sessions/live")
+        assert (await live_closed.json())["sessions"] == []
